@@ -58,6 +58,9 @@ write_nvidia_nim_list() {
 # Southpaw's NVIDIA NIM curated list (verified 2026-06-22 via build.nvidia.com)
 # Rank 1 = best main, 5 = worst. Aux column is the recommended auxiliary.
 # Use `serve api <rank>` or `serve api <api_id>` to switch.
+# NOTE: All 5 models listed have FREE endpoints on build.nvidia.com.
+# The NVIDIA_API_KEY (free-tier, 1000 RPM at signup) covers them at $0/$0.
+# Paid serverless tier is separate pricing — see pitfall #9.
 provider: nvidia-nim
 base_url: https://integrate.api.nvidia.com/v1
 api_key_env: NVIDIA_API_KEY
@@ -68,41 +71,46 @@ models:
     api_id: deepseek-ai/deepseek-v4-pro
     aux: MiniMax M3
     has_vision: false
-    price_input: 1.30
-    price_output: 2.60
-    notes: Strongest reasoning + coding. Best main pick.
+    is_free: true
+    price_input: 0.0
+    price_output: 0.0
+    notes: Strongest reasoning + coding. Best main pick. Free endpoint.
   - rank: 2
     name: GLM 5.1
     api_id: z-ai/glm-5.1
     aux: MiniMax M3
     has_vision: false
-    price_input: 0.85
-    price_output: 3.10
-    notes: Agentic + long-horizon reasoning flagship.
+    is_free: true
+    price_input: 0.0
+    price_output: 0.0
+    notes: Agentic + long-horizon reasoning flagship. Free endpoint.
   - rank: 3
     name: DeepSeek V4 Flash
     api_id: deepseek-ai/deepseek-v4-flash
     aux: MiniMax M3
     has_vision: false
-    price_input: 0.10
-    price_output: 0.20
-    notes: Cheapest; reasoning_effort=high.
+    is_free: true
+    price_input: 0.0
+    price_output: 0.0
+    notes: Cheapest reasoning; reasoning_effort=high. Free endpoint.
   - rank: 4
     name: MiniMax M3
     api_id: minimaxai/minimax-m3
     aux: DeepSeek V4 Flash
     has_vision: true
-    price_input: 0.30
-    price_output: 1.20
-    notes: Multimodal MoE; image+video support.
+    is_free: true
+    price_input: 0.0
+    price_output: 0.0
+    notes: Multimodal MoE; image+video support. Free endpoint.
   - rank: 5
     name: Nemotron Ultra
     api_id: nvidia/nemotron-3-ultra-550b-a55b
     aux: MiniMax M3
     has_vision: true
-    price_input: 0.60
-    price_output: 3.60
-    notes: NVIDIA flagship; reasoning budget 16384.
+    is_free: true
+    price_input: 0.0
+    price_output: 0.0
+    notes: NVIDIA flagship; reasoning budget 16384. Free endpoint.
 YAML
 }
 
@@ -499,15 +507,19 @@ PYEOF
 nvidia_nim_list() {
     [ -f "${NVIDIA_NIM_FILE}" ] || write_nvidia_nim_list
     python3 - <<'PYEOF'
-import yaml
-with open("/root/.local/share/turbofit/nvidia-nim-curated.yaml".replace("/root", __import__("os").path.expanduser("~"))) as f:
+import yaml, os
+with open(os.path.expanduser("~/.local/share/turbofit/nvidia-nim-curated.yaml")) as f:
     cfg = yaml.safe_load(f)
 print(f"Provider: {cfg['provider']}  base_url: {cfg['base_url']}")
+print(f"All 5 models have FREE endpoints on build.nvidia.com (NVIDIA_API_KEY, ~1000 RPM at signup)")
+print("")
 print(f"{'Rank':<5} {'Model':<22} {'Vision':<7} {'$/in':<8} {'$/out':<8} API ID")
 print("-" * 100)
 for m in cfg['models']:
     vis = "👁 yes" if m['has_vision'] else "  no"
-    print(f"{m['rank']:<5} {m['name']:<22} {vis:<7} ${m['price_input']:<7.2f} ${m['price_output']:<7.2f} {m['api_id']}")
+    pi = "FREE" if m.get('is_free') else f"${m['price_input']:.2f}"
+    po = "FREE" if m.get('is_free') else f"${m['price_output']:.2f}"
+    print(f"{m['rank']:<5} {m['name']:<22} {vis:<7} {pi:<8} {po:<8} {m['api_id']}")
 PYEOF
 }
 

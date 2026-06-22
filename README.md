@@ -68,15 +68,15 @@ serve api use <rank|api_id> [main|aux]# Wire NIM model into Hermes config
 
 ## NVIDIA NIM API (curated)
 
-5 models verified 2026-06-22 via build.nvidia.com:
+5 models verified 2026-06-22 via build.nvidia.com. **All 5 are FREE** with a `NVIDIA_API_KEY` from `build.nvidia.com` (free signup):
 
 | Rank | Model | Vision | $/in | $/out |
 |------|-------|--------|------|-------|
-| 1 | DeepSeek V4 Pro | no | $1.30 | $2.60 |
-| 2 | GLM 5.1 | no | $0.85 | $3.10 |
-| 3 | DeepSeek V4 Flash | no | $0.10 | $0.20 |
-| 4 | MiniMax M3 | 👁 yes | $0.30 | $1.20 |
-| 5 | Nemotron Ultra | 👁 yes | $0.60 | $3.60 |
+| 1 | DeepSeek V4 Pro | no | FREE | FREE |
+| 2 | GLM 5.1 | no | FREE | FREE |
+| 3 | DeepSeek V4 Flash | no | FREE | FREE |
+| 4 | MiniMax M3 | 👁 yes | FREE | FREE |
+| 5 | Nemotron Ultra | 👁 yes | FREE | FREE |
 
 ## Enforces a 64K context floor
 

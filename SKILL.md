@@ -1,7 +1,7 @@
 ---
 name: turbofit
-description: "Hardware-fit checker + multi-launcher installer (llama.cpp / Ollama / vllm / SGlang) for Hermes-Agent. Uses llmfit to verify if a model fits your VRAM/RAM, generates the right launch string for the right backend, launches the server detached, and wires it into Hermes as main or auxiliary. Also bundles a curated NVIDIA NIM API list. Enforces a 64K context floor."
-version: 4.0.0
+description: "Hardware-fit checker + multi-launcher installer (llama.cpp / Ollama / vllm / SGlang) for Hermes-Agent. Uses llmfit to verify if a model fits your VRAM/RAM, generates the right launch string for the right backend, launches the server detached, and wires it into Hermes as main or auxiliary. Also bundles a curated NVIDIA NIM free-tier API list. Enforces a 64K context floor."
+version: 1.0.0
 author: SouthpawIN
 license: MIT
 tags: [llama.cpp, ollama, vllm, sglang, llmfit, gguf, hermes-agent, nvidia-nim]
@@ -106,24 +106,24 @@ Append `--ui <value>` for any specific UI.
 
 ## NVIDIA NIM API (curated list)
 
-Bundled at `~/.local/share/turbofit/nvidia-nim-curated.yaml`. Verified from `build.nvidia.com` on 2026-06-22:
+Bundled at `~/.local/share/turbofit/nvidia-nim-curated.yaml`. Verified from `build.nvidia.com` on 2026-06-22. **All 5 models have free endpoints** — the `NVIDIA_API_KEY` you get from `build.nvidia.com` (free signup) covers them at $0/$0.
 
 | Rank | Model | Vision | $/in | $/out | API ID | Recommended aux |
 |------|-------|--------|------|-------|--------|----------------|
-| 1 | DeepSeek V4 Pro | no | $1.30 | $2.60 | `deepseek-ai/deepseek-v4-pro` | MiniMax M3 |
-| 2 | GLM 5.1 | no | $0.85 | $3.10 | `z-ai/glm-5.1` | MiniMax M3 |
-| 3 | DeepSeek V4 Flash | no | $0.10 | $0.20 | `deepseek-ai/deepseek-v4-flash` | MiniMax M3 |
-| 4 | MiniMax M3 | 👁 yes | $0.30 | $1.20 | `minimaxai/minimax-m3` | DeepSeek V4 Flash |
-| 5 | Nemotron Ultra | 👁 yes | $0.60 | $3.60 | `nvidia/nemotron-3-ultra-550b-a55b` | MiniMax M3 |
+| 1 | DeepSeek V4 Pro | no | FREE | FREE | `deepseek-ai/deepseek-v4-pro` | MiniMax M3 |
+| 2 | GLM 5.1 | no | FREE | FREE | `z-ai/glm-5.1` | MiniMax M3 |
+| 3 | DeepSeek V4 Flash | no | FREE | FREE | `deepseek-ai/deepseek-v4-flash` | MiniMax M3 |
+| 4 | MiniMax M3 | 👁 yes | FREE | FREE | `minimaxai/minimax-m3` | DeepSeek V4 Flash |
+| 5 | Nemotron Ultra | 👁 yes | FREE | FREE | `nvidia/nemotron-3-ultra-550b-a55b` | MiniMax M3 |
 
 ```bash
-serve api list                           # show the list
+serve api list                           # show the list (with FREE badges)
 serve api use 1 main                     # rank 1 as main
 serve api use 4 aux                      # rank 4 as aux (all 9 aux tasks)
 serve api use minimaxai/minimax-m3 main  # use API ID directly
 ```
 
-Requires `NVIDIA_API_KEY` in your environment (or `~/.hermes/.env`).
+Requires `NVIDIA_API_KEY` in your environment (or `~/.hermes/.env`). Get one free at https://build.nvidia.com.
 
 ## Shell aliases (auto-installed)
 
@@ -279,8 +279,12 @@ sudo dnf install cmake gcc-c++            # Fedora
 brew install cmake                        # macOS (CPU only — CUDA needs NVIDIA SDK)
 ```
 
-### 9. NVIDIA NIM requires an API key
-Set `NVIDIA_API_KEY` in `~/.hermes/.env` or shell environment before `serve api use`.
+### 9. NVIDIA NIM has TWO tiers — free and paid serverless
+The 5 models listed above all have **free endpoints** at `https://integrate.api.nvidia.com/v1` — covered by your `NVIDIA_API_KEY` from a free `build.nvidia.com` signup (~1000 RPM, no credit card).
+
+NVIDIA also sells a paid serverless tier with the same model IDs (e.g. $1.30/$2.60 for DeepSeek V4 Pro) under the same `integrate.api.nvidia.com/v1` base URL. The same API key works for both, but the free tier has tighter rate limits (1000 RPM, daily quota) and may show 429 errors under heavy load.
+
+If you hit 429 rate limits on the free tier, switch to a paid serverless key (or back off request frequency). The skill does NOT distinguish — both use `NVIDIA_API_KEY` and the same base URL.
 
 ### 10. Hermes Desktop is platform-dependent
 `hermes desktop` works where the native desktop build is available. Linux install support varies by platform — verify on your distro.
