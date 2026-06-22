@@ -1,28 +1,58 @@
 # turbofit
 
-Hardware-fit checker + llama.cpp launch string generator. Bridges `llmfit` (system memory analysis) to `llama-server` (the inference engine from llama.cpp). Enforces a 64K Hermes-Agent context floor.
+llama.cpp installer + launcher + Hermes-Agent config manager. Brings `serve` and `name` shell commands that wire `llmfit` (memory fit), `llama-server` (inference engine), and `~/.hermes/config.yaml` (model routing) into one workflow.
 
 ## Install
 
 ```bash
-hermes skills install https://github.com/SouthpawIN/turbofit/blob/main/SKILL.md
-# or:
 hermes skills install SouthpawIN/turbofit
+~/.hermes/skills/turbofit/scripts/install.sh
+source ~/.bashrc
+serve install
 ```
 
 ## What it does
 
-- **Memory-fit analysis** — answers "will this model fit in my system memory?" using `llmfit fit` and `llmfit plan`
-- **Launch string generator** — produces a copy-pasteable `llama-server` command with sensible defaults (flash attention, jinja, 64K context floor)
-- **Hardware-fit decision tree** — matches GPU/RAM tier to recommended model sizes
-- **VRAM budget reference** — KV cache + model size tables at common context lengths
+- **Auto-installs llama.cpp** from source (`serve install`), keeps it updated (`serve update`)
+- **Checks model fit** via `llmfit` (VRAM + RAM) — refuses to launch models that won't fit
+- **Generates launch strings** with sensible defaults (flash attention, jinja, 64K floor)
+- **Launches servers detached** — survives shell death, logs to `~/.local/share/turbofit/logs/`
+- **Wires models into Hermes-Agent** as main or auxiliary (all 9 aux tasks)
 
-## When to use it
+## Commands
 
-- "What model fits on my hardware?" — `llmfit fit --perfect`
-- "Give me a llama-server command for this model" — bridge script
-- "How much VRAM do I need for X at context Y?" — `llmfit plan`
-- Picking a model to download — see top fits before pulling 20+ GB
+```bash
+serve install                              # Install llama.cpp from source
+serve update                               # Update to latest master
+serve check                                # Show version status
+serve fit <model>                          # Run llmfit fit check
+serve string <alias>                       # Print launch string
+serve launch <alias>                       # Launch detached
+serve stop <alias>                         # Stop a server
+serve list                                 # List running servers
+serve catalog                              # Show registered aliases
+name <alias> <path>                        # Register a model alias
+serve config main <alias>                  # Set as Hermes main model
+serve config aux <alias>                   # Set as Hermes aux model
+```
+
+## Shell aliases (installed by install.sh)
+
+```bash
+name qwen-8b ~/models/Qwen3-8B.Q4_K_M.gguf   # register
+
+serve qwen-8b              # print launch string
+serve qwen-8b -main        # launch + set as Hermes main
+serve qwen-8b --aux        # launch + set as Hermes aux
+serve qwen-8b hermes       # launch + set main + start hermes TUI
+serve qwen-8b hermes --aux # launch + set aux + start hermes TUI
+serve qwen-8b gateway      # launch + set main + start hermes gateway
+serve qwen-8b gateway --aux# launch + set aux + start hermes gateway
+```
+
+## Enforces a 64K context floor
+
+Every launch string and server uses `ctx_size: 65536` minimum (Hermes-Agent requirement). Smaller context values are clamped automatically.
 
 ## License
 

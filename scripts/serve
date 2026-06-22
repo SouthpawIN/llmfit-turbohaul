@@ -1,0 +1,367 @@
+#!/usr/bin/env bash
+# serve — turbofit's model launcher + Hermes-Agent config manager
+# Part of the turbofit skill: github.com/SouthpawIN/turbofit
+
+set -euo pipefail
+
+# Paths
+TURBOFIT_ROOT="${TURBOFIT_ROOT:-${HOME}/.local/share/turbofit}"
+CATALOG="${HOME}/.config/turbofit/models.yaml"
+HERMES_CONFIG="${HOME}/.hermes/config.yaml"
+LLAMA_CPP_SRC="${HOME}/.local/src/llama.cpp"
+LLAMA_CPP_PREFIX="${HOME}/.local"
+
+mkdir -p "${TURBOFIT_ROOT}"/{logs,pid,port,strings} "${HOME}/.config/turbofit"
+
+# ---- llama.cpp management ----
+
+ensure_llama_cpp() {
+    if ! command -v llama-server >/dev/null 2>&1; then
+        echo "llama-server not found. Installing llama.cpp..."
+        install_llama_cpp
+    fi
+}
+
+install_llama_cpp() {
+    mkdir -p "${LLAMA_CPP_SRC%/*}"
+    if [ ! -d "${LLAMA_CPP_SRC}/.git" ]; then
+        echo "Cloning llama.cpp..."
+        git clone https://github.com/ggerganov/llama.cpp.git "${LLAMA_CPP_SRC}"
+    fi
+    cd "${LLAMA_CPP_SRC}"
+    git pull --rebase --autostash 2>/dev/null || git pull --rebase
+    cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON \
+        -DCMAKE_INSTALL_PREFIX="${LLAMA_CPP_PREFIX}"
+    cmake --build build --config Release -j"$(nproc)"
+    cmake --install build
+    export PATH="${LLAMA_CPP_PREFIX}/bin:${PATH}"
+    echo "✓ llama.cpp installed to ${LLAMA_CPP_PREFIX}/bin/llama-server"
+}
+
+update_llama_cpp() {
+    if [ ! -d "${LLAMA_CPP_SRC}/.git" ]; then
+        install_llama_cpp
+        return
+    fi
+    echo "Updating llama.cpp..."
+    cd "${LLAMA_CPP_SRC}"
+    git fetch origin
+    if ! git pull --rebase --autostash 2>/dev/null; then
+        git pull --rebase
+    fi
+    cmake --build build --config Release -j"$(nproc)"
+    cmake --install build
+    echo "✓ llama.cpp updated"
+}
+
+check_llama_cpp() {
+    local current_commit
+    current_commit=$(cd "${LLAMA_CPP_SRC}" 2>/dev/null && git rev-parse --short HEAD 2>/dev/null) || current_commit="not-installed"
+    local remote_commit
+    remote_commit=$(cd "${LLAMA_CPP_SRC}" 2>/dev/null && git rev-parse --short origin/master 2>/dev/null) || remote_commit="unknown"
+    local binary_version
+    binary_version=$(llama-server --version 2>/dev/null | head -1 || echo "not in PATH")
+    echo "Binary: ${binary_version}"
+    echo "Local commit: ${current_commit}"
+    echo "Remote commit: ${remote_commit}"
+    if [ "${current_commit}" != "${remote_commit}" ] && [ "${current_commit}" != "not-installed" ]; then
+        echo "Status: OUT OF DATE — run 'serve update'"
+    else
+        echo "Status: up to date"
+    fi
+}
+
+# ---- llmfit integration ----
+
+check_fit() {
+    local model_ref="$1"
+    local requested_ctx="${2:-65536}"
+    if [ -f "${model_ref}" ]; then
+        echo "Checking fit for GGUF: ${model_ref}"
+        llmfit plan "${model_ref}" --context "${requested_ctx}" --json || true
+    else
+        echo "Checking fit for HF model: ${model_ref}"
+        llmfit plan "${model_ref}" --context "${requested_ctx}" --json || true
+    fi
+}
+
+# ---- Launch string generation ----
+
+generate_string() {
+    local model_path="$1"
+    local ctx="${2:-65536}"
+    local port="${3:-8080}"
+    local host="${4:-127.0.0.1}"
+    local ngl="${5:-99}"
+    local threads="${6:-$(nproc)}"
+
+    # Enforce 64K floor
+    ctx=$(( ctx < 65536 ? 65536 : ctx ))
+
+    cat <<EOF
+llama-server \
+  -m "${model_path}" \
+  --host ${host} --port ${port} \
+  -ngl ${ngl} -fa on \
+  -c ${ctx} \
+  --jinja \
+  -t ${threads}
+EOF
+}
+
+# ---- Server lifecycle ----
+
+launch_server() {
+    local alias="$1"
+    local model_path="$2"
+    local port="$3"
+    local ctx="${4:-65536}"
+
+    local cmd_file="${TURBOFIT_ROOT}/strings/${alias}.sh"
+    generate_string "${model_path}" "${ctx}" "${port}" > "${cmd_file}"
+    chmod +x "${cmd_file}"
+
+    # Kill any existing process on this port
+    if [ -f "${TURBOFIT_ROOT}/port/${alias}" ]; then
+        local old_port
+        old_port=$(cat "${TURBOFIT_ROOT}/port/${alias}")
+        pkill -f "llama-server.*--port ${old_port}" 2>/dev/null || true
+        sleep 1
+    fi
+
+    # Launch detached
+    local log_file="${TURBOFIT_ROOT}/logs/${alias}.log"
+    nohup bash -c "$(cat "${cmd_file}")" > "${log_file}" 2>&1 &
+    disown
+    local pid=$!
+    echo "${pid}" > "${TURBOFIT_ROOT}/pid/${alias}"
+    echo "${port}" > "${TURBOFIT_ROOT}/port/${alias}"
+
+    # Wait for ready (up to 120s — large models need time)
+    echo "Launching ${alias} (pid ${pid}) on :${port}..."
+    for i in $(seq 1 120); do
+        if curl -sf "http://127.0.0.1:${port}/health" >/dev/null 2>&1; then
+            echo "✓ ${alias} ready on :${port} (pid ${pid})"
+            return 0
+        fi
+        # Check if process died
+        if ! kill -0 "${pid}" 2>/dev/null; then
+            echo "✗ ${alias} died during startup. Tail of log:"
+            tail -20 "${log_file}" 2>/dev/null || true
+            return 1
+        fi
+        sleep 1
+    done
+    echo "✗ ${alias} did not become healthy within 120s. Log: ${log_file}"
+    return 1
+}
+
+stop_server() {
+    local alias="$1"
+    if [ -f "${TURBOFIT_ROOT}/pid/${alias}" ]; then
+        local pid
+        pid=$(cat "${TURBOFIT_ROOT}/pid/${alias}")
+        if kill -0 "${pid}" 2>/dev/null; then
+            kill "${pid}" 2>/dev/null || true
+            sleep 1
+            kill -9 "${pid}" 2>/dev/null || true
+        fi
+        rm -f "${TURBOFIT_ROOT}/pid/${alias}" "${TURBOFIT_ROOT}/port/${alias}"
+        echo "✓ Stopped ${alias}"
+    fi
+}
+
+list_running() {
+    echo "Running models:"
+    if [ -d "${TURBOFIT_ROOT}/pid" ]; then
+        for pid_file in "${TURBOFIT_ROOT}/pid"/*; do
+            [ -f "${pid_file}" ] || continue
+            local alias
+            alias=$(basename "${pid_file}")
+            local pid
+            pid=$(cat "${pid_file}")
+            local port
+            port=$(cat "${TURBOFIT_ROOT}/port/${alias}" 2>/dev/null || echo "?")
+            if kill -0 "${pid}" 2>/dev/null; then
+                echo "  ${alias}: pid ${pid}, :${port}"
+            else
+                rm -f "${pid_file}"
+            fi
+        done
+    fi
+}
+
+# ---- Hermes-Agent config ----
+
+set_hermes_main() {
+    local model_name="$1"
+    local port="$2"
+    local base_url="http://127.0.0.1:${port}/v1"
+
+    python3 - <<PYEOF
+import yaml, os
+cfg_path = "${HERMES_CONFIG}"
+os.makedirs(os.path.dirname(cfg_path), exist_ok=True)
+with open(cfg_path) if os.path.exists(cfg_path) else open(cfg_path, "w") as f:
+    cfg = yaml.safe_load(f) if os.path.getsize(cfg_path) > 0 else {}
+cfg.setdefault("model", {})
+cfg["model"]["default"] = "${model_name}"
+cfg["model"]["base_url"] = "${base_url}"
+cfg["model"]["api_key"] = "not-needed"
+with open(cfg_path, "w") as f:
+    yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=False)
+PYEOF
+    echo "✓ Hermes-Agent main model: ${model_name} @ ${base_url}"
+}
+
+set_hermes_aux() {
+    local model_name="$1"
+    local port="$2"
+    local base_url="http://127.0.0.1:${port}/v1"
+    local tasks=(vision web_extract compression session_search skills_hub approval mcp title_generation curator)
+
+    python3 - <<PYEOF
+import yaml, os
+cfg_path = "${HERMES_CONFIG}"
+with open(cfg_path) if os.path.exists(cfg_path) else open(cfg_path, "w") as f:
+    cfg = yaml.safe_load(f) if os.path.getsize(cfg_path) > 0 else {}
+cfg.setdefault("auxiliary", {})
+tasks = ${tasks[@]@Q}
+for task in tasks:
+    cfg["auxiliary"].setdefault(task, {})
+    cfg["auxiliary"][task]["provider"] = "custom:local"
+    cfg["auxiliary"][task]["base_url"] = "${base_url}"
+    cfg["auxiliary"][task]["api_key"] = "not-needed"
+    cfg["auxiliary"][task]["model"] = "${model_name}"
+with open(cfg_path, "w") as f:
+    yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=False)
+PYEOF
+    echo "✓ Hermes-Agent aux model: ${model_name} @ ${base_url} (${#tasks[@]} tasks)"
+}
+
+# ---- Catalog ----
+
+next_port() {
+    local used=()
+    [ -f "${CATALOG}" ] && used+=($(grep -oE "port: [0-9]+" "${CATALOG}" 2>/dev/null | grep -oE "[0-9]+" || true))
+    local port=8080
+    while printf "%s\n" "${used[@]}" | grep -qx "${port}"; do
+        port=$((port + 1))
+    done
+    echo "${port}"
+}
+
+register_alias() {
+    local alias="$1"
+    local path="$2"
+    if [ -z "${alias}" ] || [ -z "${path}" ]; then
+        echo "Usage: name <alias> <path-to-gguf-or-hf-repo>"
+        return 1
+    fi
+    local port
+    port=$(next_port)
+    python3 - <<PYEOF
+import yaml, os
+cfg_path = "${CATALOG}"
+os.makedirs(os.path.dirname(cfg_path), exist_ok=True)
+with open(cfg_path) if os.path.exists(cfg_path) else open(cfg_path, "w") as f:
+    cfg = yaml.safe_load(f) if os.path.getsize(cfg_path) > 0 else {}
+cfg.setdefault("models", {})
+cfg["models"]["${alias}"] = {"path": "${path}", "port": ${port}}
+with open(cfg_path, "w") as f:
+    yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=False)
+PYEOF
+    echo "✓ Registered '${alias}' → ${path} on :${port}"
+}
+
+list_catalog() {
+    if [ ! -f "${CATALOG}" ]; then
+        echo "Catalog empty. Use 'name <alias> <path>' to register a model."
+        return
+    fi
+    python3 - <<PYEOF
+import yaml
+with open("${CATALOG}") as f:
+    cfg = yaml.safe_load(f) or {}
+models = cfg.get("models", {})
+if not models:
+    print("Catalog empty.")
+else:
+    print(f"{'Alias':<25} {'Port':<8} Path")
+    print("-" * 80)
+    for alias, info in sorted(models.items()):
+        print(f"{alias:<25} {info.get('port', '?'):<8} {info.get('path', '?')}")
+PYEOF
+}
+
+# ---- Command dispatcher ----
+
+usage() {
+    cat <<EOF
+turbofit serve — llama.cpp launcher + Hermes-Agent config
+
+USAGE:
+  serve install                                 Install llama.cpp from source
+  serve update                                  Update llama.cpp to latest
+  serve check                                   Check llama.cpp version status
+  serve fit <model> [ctx]                       Run llmfit fit check for a model
+  serve string <alias>                          Print the launch string for an alias
+  serve launch <alias>                          Launch the server for an alias (detached)
+  serve stop <alias>                            Stop a running server
+  serve list                                    List running servers
+  serve catalog                                 Show model catalog
+  serve register <alias> <path>                 Register a model alias
+  serve config main <alias>                     Set as Hermes-Agent main model
+  serve config aux <alias>                      Set as Hermes-Agent aux model (all tasks)
+
+SHELL ALIASES (auto-installed to ~/.bashrc):
+  serve <alias>                                 Print launch string + check fit
+  serve <alias> -main                           Launch + set as Hermes main
+  serve <alias> --aux                           Launch + set as Hermes aux
+  serve <alias> hermes                          Launch + set main + start hermes TUI
+  serve <alias> hermes --aux                    Launch + set aux + start hermes TUI
+  serve <alias> gateway                         Launch + set main + start hermes gateway
+  serve <alias> gateway --aux                   Launch + set aux + start hermes gateway
+  name <alias> <path>                           Register a model alias
+EOF
+}
+
+case "${1:-help}" in
+    install)        install_llama_cpp ;;
+    update)         update_llama_cpp ;;
+    check)          check_llama_cpp ;;
+    fit)            shift; check_fit "$@" ;;
+    string)         shift
+                    info=$(python3 -c "import yaml; cfg=yaml.safe_load(open('${CATALOG}')); print(cfg['models'].get('$1', {}).get('path', ''), cfg['models'].get('$1', {}).get('port', 8080), cfg['models'].get('$1', {}).get('ctx', 65536))" 2>/dev/null || echo "")
+                    path=$(echo "$info" | awk '{print $1}')
+                    port=$(echo "$info" | awk '{print $2}')
+                    ctx=$(echo "$info" | awk '{print $3}')
+                    if [ -z "$path" ]; then
+                        echo "Unknown alias: $1. Use 'serve register <alias> <path>' or 'name <alias> <path>'."
+                        exit 1
+                    fi
+                    generate_string "$path" "$ctx" "$port"
+                    ;;
+    launch)         shift
+                    info=$(python3 -c "import yaml; cfg=yaml.safe_load(open('${CATALOG}')); print(cfg['models'].get('$1', {}).get('path', ''), cfg['models'].get('$1', {}).get('port', 8080), cfg['models'].get('$1', {}).get('ctx', 65536))" 2>/dev/null || echo "")
+                    path=$(echo "$info" | awk '{print $1}')
+                    port=$(echo "$info" | awk '{print $2}')
+                    ctx=$(echo "$info" | awk '{print $3}')
+                    launch_server "$1" "$path" "$port" "$ctx"
+                    ;;
+    stop)           shift; stop_server "$1" ;;
+    list|ls|ps)     list_running ;;
+    catalog)        list_catalog ;;
+    register|name)  shift; register_alias "$@" ;;
+    config)         shift
+                    role="${1:-}"; shift
+                    alias="${1:-}"; shift
+                    port=$(python3 -c "import yaml; cfg=yaml.safe_load(open('${CATALOG}')); print(cfg['models'].get('$alias', {}).get('port', 8080))" 2>/dev/null || echo 8080)
+                    case "${role}" in
+                        main) set_hermes_main "${alias}" "${port}" ;;
+                        aux)  set_hermes_aux "${alias}" "${port}" ;;
+                        *)    echo "Usage: serve config {main|aux} <alias>"; exit 1 ;;
+                    esac
+                    ;;
+    help|*)         usage ;;
+esac
