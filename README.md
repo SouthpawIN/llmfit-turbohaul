@@ -1,5 +1,7 @@
 # turbofit
 
+Checks if a model fits on your hardware, and launches it for you. Can self-configure for Main or Auxiliary model in Hermes-Agent.
+
 Generate, install, and launch llama.cpp (llama-server) with the `serve` and `name` shell commands. Auto-installs llama.cpp from source, updates it when stale, uses llmfit to verify model fit in VRAM/RAM, launches the server detached, and wires it into Hermes-Agent as the main or auxiliary model. Enforces a 64K context floor.
 
 ## Install
