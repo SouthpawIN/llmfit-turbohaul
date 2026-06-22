@@ -1,7 +1,7 @@
 ---
-name: llmfit-turbohaul
+name: turbofit
 description: "Generate optimized llama-server launch strings and turbohaul-manager manifests using llmfit hardware detection + TurboQuant flag doctrine. Use when setting up a new model in turbohaul, when someone asks 'what fits on my GPU', or when building a llama.cpp command from scratch."
-version: 1.1.0
+version: 1.2.0
 author: SouthpawIN
 license: MIT
 tags: [turbohaul, llmfit, llama.cpp, turboquant, gguf, inference, manifest]
@@ -10,9 +10,9 @@ metadata:
     related_skills: [local-llm-fleet-management, omni-va-local-server, llama-cpp, gguf-quantization]
 ---
 
-# Turbohaul + llmfit
+# Turbofit
 
-Two tools, one workflow: **llmfit** detects hardware and recommends models that fit → **turbohaul-manager** manages the inference sidecar with FIFO queuing, grace windows, and model hot-swap → the bridge generates an optimized `llama-server` command string or turbohaul manifest YAML.
+Two tools, one workflow: **llmfit** detects hardware and recommends models that fit → **turbohaul-manager** (renamed from `llmfit-turbohaul` — same content, simpler name) manages the inference sidecar with FIFO queuing, grace windows, and model hot-swap → the bridge generates an optimized `llama-server` command string or turbohaul manifest YAML.
 
 ## ⚠ Context Floor: 64K (65536 tokens)
 

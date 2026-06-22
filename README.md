@@ -1,13 +1,13 @@
-# llmfit-turbohaul
+# turbofit
 
-Generate optimized llama-server launch strings and turbohaul-manager manifests using llmfit hardware detection + TurboQuant flag doctrine.
+Hardware-fit + TurboQuant launch string generator. Bridges `llmfit` to `turbohaul-manager` with a 64K Hermes-Agent context floor.
 
 ## Install
 
 ```bash
-hermes skills install https://github.com/SouthpawIN/llmfit-turbohaul/blob/main/SKILL.md
+hermes skills install https://github.com/SouthpawIN/turbofit/blob/main/SKILL.md
 # or:
-hermes skills install SouthpawIN/llmfit-turbohaul
+hermes skills install SouthpawIN/turbofit
 ```
 
 ## What it does
