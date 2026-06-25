@@ -48,7 +48,5 @@ post_install:
   - command: bash scripts/install.sh
     description: Wire serve/name shell functions into ~/.bashrc
 
-# Note: No env_template section — the env_template placeholders
-# (nvapi-xxx, sk-or-v1-xxx) trigger the security scanner's
-# credential_exposure check. Users set keys manually via hermes setup
-# or by editing ~/.hermes/.env directly.
+# Note: No env_template section to avoid scanner false positives.
+# Users set API keys via `hermes setup` or `hermes auth add <provider>`.
