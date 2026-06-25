@@ -81,8 +81,8 @@ The model universe, pricing, and benchmarks are stored in [`references/model-dat
 1. **Daily research cron** runs at 6am — scans OpenRouter, HuggingFace, Price Per Token, and LLMCheck for new models, pricing changes, and benchmark updates
 2. **Research script** (`scripts/research-models.py`) fetches live data and generates a report
 3. **Agent reviews** the report, updates `model-database.yaml` with new models or pricing changes
-4. **GitHub sync** (`scripts/sync-github.sh`) pushes updates to `SouthpawIN/sovth-config`
-5. **All turbofit users** can pull fresh data from GitHub: `git pull origin main` in their local sovth-config repo
+4. **GitHub sync** (`scripts/sync-github.sh`) pushes updates to `SouthpawIN/turbofit` (primary) and `SouthpawIN/sovth-config` (collection)
+5. **All turbofit users** get fresh data by running `hermes skills update turbofit`
 
 ### What's in the database
 
@@ -103,11 +103,11 @@ python3 ~/.hermes/skills/turbofit/scripts/research-models.py
 # Check the latest report
 cat ~/.hermes/skills/turbofit/references/research-report.md
 
-# Sync to GitHub manually
+# Sync to GitHub manually (pushes to SouthpawIN/turbofit + SouthpawIN/sovth-config)
 bash ~/.hermes/skills/turbofit/scripts/sync-github.sh
 
-# Pull fresh data from GitHub (for end users)
-cd ~/projects/sovth-config && git pull origin main
+# Update turbofit skill (for end users)
+hermes skills update turbofit
 ```
 
 ## Opinionated defaults (turbofit v5)
