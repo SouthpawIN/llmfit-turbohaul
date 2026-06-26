@@ -128,7 +128,7 @@ Ranked by all three roles (vision required, cost minimized, context ≥262K):
 6. **Qwen 3.7 MAX is the MMLU king.** 93.7% MMLU — #1 globally. Best for knowledge-heavy tasks. Pair with MiniMax M3 (free vision + compression).
 7. **DeepSeek V4 Pro is the SWE-bench king.** 80.6% SWE-bench Verified — highest open model. Best for coding. Pair with MiniMax M3 (free vision + compression).
 8. **Qwen 3.7 MAX is the agentic king.** SWE-bench Pro 60.6%, SWE-bench Multilingual 78.3%, HMMT 97.1%. Best for long-horizon agent tasks. Pair with Qwen 3.7 Plus (same family, Tool Gateway, vision).
-9. **Same-family pairings are efficient.** Qwen MAX + Qwen Plus share tokenizers. DeepSeek Pro + DeepSeek Flash share architecture. Same-family = better compression handoff.
+9. **Never pair two text-only models.** If the main has no vision, the aux MUST have vision. DeepSeek V4 Pro + DeepSeek V4 Flash = both blind = broken fleet. Always prioritize abilities and cost over family matching.
 
 ## Key Principles
 
