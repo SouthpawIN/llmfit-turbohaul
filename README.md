@@ -1,4 +1,4 @@
-# turbofit v5.2 — opinionated unified LLM backend
+# turbofit v1.1 — opinionated unified LLM backend
 
 Hardware-fit checker + multi-launcher orchestrator for Hermes-Agent. Uses `llmfit` to verify model fit, generates accurate launch strings for **llama.cpp / Ollama / vLLM / SGlang**, launches detached, wires Hermes config, and adapts to live VRAM pressure via a scaling ladder. Dynamic model database auto-updates daily with real pricing from the OpenRouter API.
 
