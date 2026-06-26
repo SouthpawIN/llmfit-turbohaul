@@ -10,7 +10,7 @@ End-user UX: `serve auto main` → done.
 hermes skills install SouthpawIN/turbofit/skills/turbofit
 ```
 
-## What's new in v5.2
+## What's new in v1.1
 
 - **Dynamic model database** (`references/model-database.yaml`) — auto-updated daily via research cron
 - **API pairing matrix** — optimal main+aux pairings across 4 context tiers and 5 price tiers
