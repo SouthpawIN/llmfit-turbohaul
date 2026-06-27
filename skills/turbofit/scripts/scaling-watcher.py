@@ -165,11 +165,15 @@ def get_running_daemons():
                         "mmproj": model.get("mmproj", ""),
                     })
                     break
-        # Also check for non-turbofit-prefixed services (carnice.service, darwin.service)
+        # Also check for non-turbofit-prefixed services ({alias}.service)
+        # Iterate through ALL catalog model aliases, not just a hardcoded subset,
+        # so any model in the catalog (carnice, darwin, prism-eagle, etc.) is
+        # detected even when its service isn't prefixed with "turbofit-".
+        catalog_aliases = list(catalog.get("models", {}).keys())
         for line in result.stdout.split("\n"):
-            for short_name in ("carnice", "darwin"):
-                if f"{short_name}.service" in line and ".service" in line:
-                    alias = short_name
+            for alias in catalog_aliases:
+                svc_name = f"{alias}.service"
+                if svc_name in line and ".service" in line:
                     model = catalog.get("models", {}).get(alias, {})
                     active = "active" in line
                     already = any(d["alias"] == alias for d in daemons)
@@ -180,7 +184,7 @@ def get_running_daemons():
                             "gpu": model.get("gpu", 0),
                             "port": model.get("port", 0),
                             "ctx": model.get("ctx", 262144),
-                            "service": f"{short_name}.service",
+                            "service": svc_name,
                             "active": active,
                             "binary": model.get("binary", ""),
                             "path": model.get("path", ""),
@@ -716,12 +720,28 @@ def main():
 
                         if contraction_level >= 4 and restore_level < 4:
                             all_daemons = get_running_daemons()
+                            per_gpu = get_per_gpu_vram()
                             for d in all_daemons:
                                 if d["role"] == "aux" and not d["active"]:
-                                    if d["size_gb"] < total_free:
-                                        log.info(f"  ▲ START AUX: {d['alias']}")
+                                    # Check the free VRAM on the SPECIFIC GPU
+                                    # this aux daemon is assigned to — not the
+                                    # sum across all GPUs (which could be high
+                                    # while the target GPU is still full).
+                                    target_gpu_id = d.get("gpu", 0)
+                                    gpu_free = next(
+                                        (free for (gid, free, _t, _u) in per_gpu
+                                         if gid == target_gpu_id),
+                                        0.0,
+                                    )
+                                    needed = d["size_gb"] + 2  # 2GB headroom
+                                    if gpu_free >= needed:
+                                        log.info(f"  ▲ START AUX: {d['alias']} "
+                                                 f"(GPU {target_gpu_id} free {gpu_free:.1f}GB >= {needed:.1f}GB)")
                                         daemon_action("start", d["alias"])
                                         time.sleep(5)
+                                    else:
+                                        log.debug(f"  SKIP AUX {d['alias']}: GPU {target_gpu_id} "
+                                                  f"free {gpu_free:.1f}GB < {needed:.1f}GB needed")
 
                         if contraction_level >= 3 and restore_level < 3 and swapped_to_alias:
                             log.info(f"  ▲ SWAP BACK: {swapped_to_alias} → {local_model}")
