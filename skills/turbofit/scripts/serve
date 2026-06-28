@@ -2659,13 +2659,32 @@ print(f'Updated catalog: mmproj set to $new_mmproj')
 # ─────────────────────────────────────────────────────────────────────────────
 
 recommend_fit() {
-    echo "Scanning catalog (ctx≥64K, tok/s≥25, Q4, vision preferred)..."
-    python3 - "$CATALOG" <<'PYEOF'
-import sys, yaml, os
+    echo "Scanning catalog + pulling benchmark results from GitHub..."
+    python3.12 - "$CATALOG" <<'PYEOF'
+import sys, yaml, os, json
+from urllib.request import urlopen
+from urllib.error import URLError
+
 cat_path = sys.argv[1]
 with open(cat_path) as f:
     cfg = yaml.safe_load(f) or {}
 models = cfg.get("models", {})
+
+# Try to pull benchmark results from GitHub
+GITHUB_RAW = "https://raw.githubusercontent.com/SouthpawIN/turbofit/main/skills/turbofit/references/benchmark-results.json"
+bench_data = None
+try:
+    resp = urlopen(GITHUB_RAW, timeout=10)
+    bench_data = json.loads(resp.read())
+    print(f"  (benchmark results from GitHub: {bench_data.get('date', '?')})")
+except Exception:
+    pass
+
+# Build a lookup from benchmark results
+bench_lookup = {}
+if bench_data:
+    for r in bench_data.get("results", []):
+        bench_lookup[r.get("alias", r.get("name", ""))] = r
 
 results = []
 for alias, m in models.items():
@@ -2677,18 +2696,50 @@ for alias, m in models.items():
     tier   = m.get("tier", "c")
     vision = m.get("vision", False)
     size   = m.get("size_gb", 99)
+    role   = m.get("role", "either")
     if ctx < 65536: continue
-    if tok_s < 25: continue
-    tier_score = {"s": 5, "sf": 4, "sd": 3, "f": 2, "c": 1}.get(tier, 1)
-    score = tier_score * 10 + (10 if vision else 0) + (tok_s // 25)
-    results.append((score, alias, tier, tok_s, vision, size))
 
+    # If we have benchmark data, use it
+    bench = bench_lookup.get(alias, {})
+    if bench:
+        tok_s = bench.get("tok_s", tok_s)
+        tier = bench_data.get("tier_assignments", {}).get(alias, tier)
+        iq = bench.get("intelligence_score", 0)
+        size = bench.get("size_gb", size)
+    else:
+        iq = 0
+
+    if tok_s < 25 and not iq: continue
+
+    tier_score = {"s": 5, "sf": 4, "sd": 3, "f": 2, "c": 1}.get(tier, 1)
+    # Rank by: intelligence first, then tier, then vision, then speed
+    score = iq * 10 + tier_score * 50 + (25 if vision else 0) + (tok_s // 25)
+    results.append((score, alias, tier, tok_s, vision, size, role, iq))
+
+# Sort: score desc
 results.sort(key=lambda x: -x[0])
-print(f"\n{'RANK':<5} {'ALIAS':<35} {'TIER':<4} {'tok/s':>6} {'VISION':>6} {'SIZE':>6} {'SCORE':>5}")
-print("-" * 80)
-for i, (score, alias, tier, tok_s, vision, size) in enumerate(results[:20], 1):
-    print(f"{i:<5} {alias:<35} {tier:<4} {tok_s:>6} {' 👁' if vision else '':>6} {size:>5.0f}GB {score:>5}")
-print(f"\n{len(results)} models match (ctx≥64K, tok/s≥25). Ranked by tier + vision + speed.")
+
+print(f"\n{'RANK':<5} {'ALIAS':<35} {'TIER':<4} {'IQ':>5} {'tok/s':>6} {'VISION':>6} {'SIZE':>6} {'ROLE':>6} {'SCORE':>5}")
+print("-" * 90)
+for i, (score, alias, tier, tok_s, vision, size, role, iq) in enumerate(results[:20], 1):
+    iq_str = f"{iq:.0f}" if iq else "—"
+    print(f"{i:<5} {alias:<35} {tier:<4} {iq_str:>5} {tok_s:>6} {' 👁' if vision else '':>6} {size:>5.0f}GB {role:>6} {score:>5}")
+
+# Print recommendations
+mains = [r for r in results if r[6] in ("main", "either")]
+auxs = [r for r in results if r[6] in ("aux", "either") and r[4]]  # vision for aux
+
+if mains:
+    best_main = mains[0]
+    print(f"\n  ⭐ MAIN: {best_main[1]} (tier={best_main[2]}, IQ={best_main[7] or '—'}, {best_main[3]} tok/s, {best_main[5]:.0f}GB)")
+if auxs:
+    best_aux = auxs[0]
+    print(f"  ⭐ AUX:  {best_aux[1]} (tier={best_aux[2]}, IQ={best_aux[7] or '—'}, {best_aux[3]} tok/s, {best_aux[5]:.0f}GB, vision=Y)")
+
+print(f"\n{len(results)} models match. Ranked by intelligence → tier → vision → speed.")
+if not bench_data:
+    print("  ⚠ No benchmark results from GitHub. Using catalog tier + tok_s_target only.")
+    print("  Run `python3.12 ~/.hermes/skills/turbofit/scripts/benchmark-pipeline.py --push` to benchmark and publish.")
 PYEOF
 }
 
