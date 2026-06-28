@@ -1,0 +1,64 @@
+# turbofit auto-update configuration
+# Edit this file to control which components are auto-updated.
+# After editing, run:
+#   ~/.hermes/skills/turbofit/scripts/auto-update.sh --check
+# to preview, then restart the timer if you changed check_interval:
+#   systemctl --user restart turbofit-auto-update.timer
+#
+# Component types:
+#   git    - clone/pull a git repo; optionally rebuild via build_cmd
+#   pip    - upgrade a Python package (hermes-agent uses its own `hermes update`)
+#   npm    - `npm update -g <package>`
+#   cargo  - `cargo install --force <package>`
+#
+# restart_services lists systemd USER services (no .service suffix needed)
+# that should be restarted ONLY if this component was actually updated.
+
+check_interval: 3600  # seconds (1 hour default)
+
+components:
+  llama-cpp-atomic:
+    enabled: true
+    type: git
+    repo: ~/projects/LLM-Infra/llama.cpp-atomic
+    rebuild: true
+    build_cmd: "cd build && cmake --build . --config Release -j$(nproc)"
+    restart_services:
+      - turbofit-darwin-28b-reason.service
+      - turbofit-carnice.service
+
+  llama-cpp-stock:
+    enabled: true
+    type: git
+    repo: ~/projects/LLM-Infra/llama.cpp
+    rebuild: true
+    build_cmd: "cd build && cmake --build . --config Release -j$(nproc)"
+    restart_services: []
+
+  hermes-agent:
+    enabled: true
+    type: pip
+    package: hermes-agent
+    # hermes-agent manages its own service lifecycle via `hermes update`
+    restart_services: []
+
+  herm-tui:
+    enabled: true
+    type: npm
+    package: herm
+    restart_services: []
+
+  sirvir:
+    enabled: true
+    type: git
+    repo: ~/projects/sirvir
+    rebuild: false
+    restart_services: []
+
+  turbofit:
+    enabled: true
+    type: git
+    repo: ~/projects/turbofit
+    rebuild: false
+    restart_services:
+      - turbofit-gateway.service
