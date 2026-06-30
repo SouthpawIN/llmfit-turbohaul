@@ -800,19 +800,50 @@ def main():
                     last_action_time = time.time()
                     time.sleep(10)
 
-
             # ─── Endpoint health check ──────────────────────────────
-            # Actually curl the main endpoint. If systemctl says active
-            # but the endpoint returns 404 or times out, restart it.
+            # Actually probe the main endpoint. If systemctl says active
+            # but the endpoint isn't serving, restart it.
+            #
+            # BUG HISTORY: this check used to hit `/models` or `/v1models`
+            # (both 404 on llama-server), which caused the watcher to think
+            # the daemon was down during its 20s load window and enter a
+            # restart loop — kill the daemon 20s after it became ready,
+            # poll again, see 404 (loading), kill again, ad infinitum.
+            #
+            # Fix: probe the actual llama-server endpoint `/v1/models` (or
+            # fall back to `/health`); AND honor a startup grace window
+            # after any recent restart so we don't re-probe a still-loading
+            # daemon and trigger another restart.
             if contraction_level < 5:
-                import urllib.request
-                try:
-                    req = urllib.request.Request(local_url + "models")
-                    urllib.request.urlopen(req, timeout=5)
+                endpoint_ok = False
+                # Startup grace: skip probe for 30s after any restart/start
+                # to let the daemon finish loading its GGUF into VRAM.
+                grace_elapsed = time.time() - last_action_time
+                if grace_elapsed < 30.0:
+                    # Still in grace window — assume healthy, don't probe.
+                    # This breaks the previous restart loop.
                     endpoint_ok = True
-                except Exception:
-                    endpoint_ok = False
-                
+                else:
+                    import urllib.request
+                    # local_url is e.g. "http://127.0.0.1:11500/v1" — strip
+                    # the /v1 suffix so we can probe canonical llama-server
+                    # paths. Try /v1/models first (most reliable), then
+                    # /health as a fallback (some llama-server builds
+                    # return JSON in /health instead of "ok").
+                    base = local_url.rstrip("/")
+                    if base.endswith("/v1"):
+                        base = base[:-3]
+                    probe_paths = ["/v1/models", "/health"]
+                    for probe in probe_paths:
+                        try:
+                            req = urllib.request.Request(base + probe)
+                            with urllib.request.urlopen(req, timeout=3) as resp:
+                                if resp.status == 200:
+                                    endpoint_ok = True
+                                    break
+                        except Exception:
+                            continue
+
                 if not endpoint_ok and non_turbofit_used < 15:
                     log.warning(f"Main endpoint {local_url} is DOWN but VRAM is free — restarting {local_model}")
                     daemon_action("restart", local_model)

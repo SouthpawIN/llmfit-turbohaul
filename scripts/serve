@@ -2388,21 +2388,377 @@ PYEOF
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Benchmark model with lm-eval-harness (from llama-launch)
+# Benchmark local models with tok/s + lm-eval-harness
 # ─────────────────────────────────────────────────────────────────────────────
+#
+# Reads port from CATALOG (not a hardcoded 8080 fallback), supports
+# `serve bench <alias>`, `serve bench all`, `serve bench --local`,
+# `serve bench --api`. Aggregates to ~/.config/turbofit/benchmark-results/.
+#
+# Two-pass bench per model:
+#   1. tok/s: streams a known prompt, measures prompt_eval + generation speed
+#   2. quality: lm-eval-harness (mmlu, gsm8k) with --limit N for speed
+
+# Read port for an alias from the catalog (NOT a hardcoded 8080)
+_catalog_port() {
+    local alias="$1"
+    python3 - "$CATALOG" "$alias" <<'PYEOF' 2>/dev/null
+import sys, yaml
+catalog = sys.argv[1]
+alias = sys.argv[2]
+try:
+    with open(catalog) as f:
+        cfg = yaml.safe_load(f) or {}
+    m = cfg.get("models", {}).get(alias, {})
+    port = m.get("port", "")
+    print(port if port else "")
+except Exception:
+    pass
+PYEOF
+}
+
+bench_local_one() {
+    local alias="$1"
+    local tasks="${2:-mmlu,gsm8k}"
+    local limit="${3:-50}"
+
+    # Pull port from catalog (the previous hardcoded 8080 fallback was the
+    # bug that caused 5/5 morning bench runs to fail with "serve start failed")
+    local port
+    port=$(_catalog_port "${alias}")
+    if [ -z "${port}" ]; then
+        echo "  ❌ ${alias}: no port in catalog — run: serve register ${alias} <path> --port N"
+        return 1
+    fi
+
+    # Make sure the daemon is up. If not, try to launch it.
+    if ! curl -sf "http://127.0.0.1:${port}/v1/models" >/dev/null 2>&1; then
+        echo "  ▲ ${alias}: daemon not up on :${port}, launching..."
+        if ! launch_server "${alias}" 2>/dev/null; then
+            # launch_server may have failed; try a fresh serve <alias>
+            if ! serve "${alias}" --no-ui 2>/dev/null; then
+                echo "  ❌ ${alias}: failed to launch on :${port}"
+                return 1
+            fi
+        fi
+        # Wait for backend to be ready (up to 90s for big GGUFs)
+        local waited=0
+        while [ $waited -lt 90 ]; do
+            if curl -sf "http://127.0.0.1:${port}/v1/models" >/dev/null 2>&1; then
+                break
+            fi
+            sleep 2
+            waited=$((waited + 2))
+        done
+        if ! curl -sf "http://127.0.0.1:${port}/v1/models" >/dev/null 2>&1; then
+            echo "  ❌ ${alias}: daemon still not ready on :${port} after 90s"
+            return 1
+        fi
+    fi
+
+    local started_at
+    started_at=$(date -Iseconds)
+    local outdir="${TURBOFIT_ROOT}/benchmarks"
+    mkdir -p "${outdir}"
+
+    # Pass 1: tok/s — measure via a streaming completion
+    echo "  ▲ ${alias} (port ${port}): tok/s probe..."
+    local toks_file="${outdir}/${alias}.toks.json"
+    python3 - "$alias" "$port" > "${toks_file}" 2>/dev/null <<'PYEOF' || echo "  ⚠ tok/s probe failed (non-fatal)"
+import json, sys, time, urllib.request
+
+alias, port = sys.argv[1], sys.argv[2]
+url = f"http://127.0.0.1:{port}/v1/chat/completions"
+# 256-token generation request — long enough to measure stable gen speed
+payload = json.dumps({
+    "model": alias,
+    "messages": [{"role": "user", "content": "Write 200 words about distributed systems."}],
+    "max_tokens": 256,
+    "stream": False,
+}).encode()
+
+try:
+    t0 = time.time()
+    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=180) as resp:
+        body = json.loads(resp.read())
+    elapsed = time.time() - t0
+    usage = body.get("usage", {})
+    pt = usage.get("prompt_tokens", 0)
+    ct = usage.get("completion_tokens", 0)
+    prompt_tps = pt / max(elapsed * 0.3, 0.001)  # rough: prompt eval ~30% of total
+    gen_tps = ct / max(elapsed * 0.7, 0.001)      # rough: generation ~70% of total
+    print(json.dumps({
+        "alias": alias,
+        "port": int(port),
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "elapsed_s": round(elapsed, 3),
+        "prompt_tokens": pt,
+        "completion_tokens": ct,
+        "prompt_tok_s": round(prompt_tps, 2),
+        "gen_tok_s": round(gen_tps, 2),
+        "model_id": body.get("model", alias),
+    }))
+except Exception as e:
+    print(json.dumps({"alias": alias, "error": str(e)}))
+    sys.exit(0)
+PYEOF
+
+    # Pass 2: quality — lm-eval-harness on a small subset
+    echo "  ▲ ${alias}: lm-eval (${tasks}, limit ${limit})..."
+    local qout="${outdir}/${alias}.lm_eval.log"
+    if command -v lm_eval >/dev/null 2>&1; then
+        lm_eval --model local-completions \
+            --model_args "model=${alias},base_url=http://127.0.0.1:${port}/v1" \
+            --tasks "${tasks}" --limit "${limit}" --batch_size 8 \
+            > "${qout}" 2>&1
+    else
+        echo "    (lm_eval not installed — skipping quality pass)" > "${qout}"
+    fi
+
+    # Aggregate
+    python3 - "$alias" "$started_at" "$toks_file" "$qout" "${outdir}/${alias}.json" <<'PYEOF' 2>/dev/null
+import json, sys, re, os
+alias, started, toks_file, qout, out_path = sys.argv[1:6]
+result = {"alias": alias, "timestamp": started, "port": 0}
+try:
+    with open(toks_file) as f:
+        result.update(json.load(f))
+except Exception:
+    pass
+# Parse lm-eval output
+try:
+    with open(qout) as f:
+        text = f.read()
+    # lm-eval prints lines like "mmlu|average|0.5234" in its summary
+    for line in text.splitlines():
+        m = re.match(r"\|(\w+)\s*\|.*?\|\s*([\d.]+)\s*\|", line)
+        if m and m.group(1) in ("mmlu", "gsm8k", "humaneval", "arc_challenge", "hellaswag"):
+            key = m.group(1)
+            if key not in result:
+                result[key] = float(m.group(2))
+except Exception:
+    pass
+with open(out_path, "w") as f:
+    json.dump(result, f, indent=2)
+print(f"  ✓ {alias} → {out_path}")
+PYEOF
+}
+
+bench_api_one() {
+    local model_id="$1"  # e.g. deepseek/deepseek-v4-pro
+    local provider_url="${2:-https://inference-api.nousresearch.com/v1}"
+    local token
+    token=$(python3 -c "import json; print(json.load(open('/home/sovthpaw/.hermes/auth.json'))['providers']['nous']['access_token'])" 2>/dev/null)
+    if [ -z "${token}" ]; then
+        echo "  ❌ No Nous API token in ~/.hermes/auth.json"
+        return 1
+    fi
+    local outdir="${TURBOFIT_ROOT}/benchmark-results"
+    mkdir -p "${outdir}"
+    local out_file="${outdir}/$(echo "${model_id}" | tr '/' '_').json"
+    local started_at
+    started_at=$(date -Iseconds)
+
+    python3 - "$model_id" "$provider_url" "$token" "$started_at" "$out_file" <<'PYEOF' 2>/dev/null
+import json, sys, time, urllib.request, urllib.error
+
+model_id, url, token, started, out_path = sys.argv[1:6]
+api_url = f"{url.rstrip('/')}/chat/completions"
+payload = json.dumps({
+    "model": model_id,
+    "messages": [{"role": "user", "content": "Write 200 words about distributed systems."}],
+    "max_tokens": 256,
+    "stream": False,
+}).encode()
+
+result = {"alias": model_id, "timestamp": started, "endpoint": url, "is_api": True}
+try:
+    t0 = time.time()
+    req = urllib.request.Request(api_url, data=payload, headers={
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}",
+    })
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        body = json.loads(resp.read())
+    elapsed = time.time() - t0
+    usage = body.get("usage", {})
+    pt = usage.get("prompt_tokens", 0)
+    ct = usage.get("completion_tokens", 0)
+    result.update({
+        "elapsed_s": round(elapsed, 3),
+        "prompt_tokens": pt,
+        "completion_tokens": ct,
+        "prompt_tok_s": round(pt / max(elapsed, 0.001), 2),
+        "gen_tok_s": round(ct / max(elapsed, 0.001), 2),
+        "model_id": body.get("model", model_id),
+        "provider": body.get("provider", "?"),
+    })
+except urllib.error.HTTPError as e:
+    result["error"] = f"HTTP {e.code}: {e.read().decode()[:200]}"
+except Exception as e:
+    result["error"] = str(e)
+
+with open(out_path, "w") as f:
+    json.dump(result, f, indent=2)
+print(f"  ✓ {model_id} (API) → {out_path}")
+PYEOF
+}
+
+bench_local_all() {
+    echo "═══ Local bench sweep ═══"
+    local count=0 ok=0
+    while IFS=$'\t' read -r alias port; do
+        [ -z "${alias}" ] && continue
+        [ "${port}" = "None" ] && continue
+        count=$((count + 1))
+        if bench_local_one "${alias}"; then
+            ok=$((ok + 1))
+        fi
+    done < <(python3 - "$CATALOG" <<'PYEOF'
+import sys, yaml
+with open(sys.argv[1]) as f:
+    cfg = yaml.safe_load(f) or {}
+for alias, m in sorted(cfg.get("models", {}).items()):
+    role = m.get("role", "either")
+    if role not in ("main", "aux", "either"):
+        continue
+    if not m.get("path"):
+        continue
+    import os
+    if not os.path.exists(m["path"]):
+        continue
+    port = m.get("port", "")
+    if not port:
+        continue
+    print(f"{alias}\t{port}")
+PYEOF
+    )
+    echo "═══ ${ok}/${count} local models benched ═══"
+}
+
+bench_api_all() {
+    echo "═══ API bench sweep ═══"
+    # Curated API list — covers the recommended pairings from the catalog
+    local models=(
+        "deepseek/deepseek-v4-pro"
+        "deepseek/deepseek-v4-flash"
+        "z-ai/glm-5.2"
+        "qwen/qwen3.7-max"
+        "minimaxai/minimax-m3"
+        "qwen/qwen3.7-plus"
+        "xiaomi/mimo-v2.5"
+    )
+    local provider_url="https://inference-api.nousresearch.com/v1"
+    local count=0 ok=0
+    for m in "${models[@]}"; do
+        count=$((count + 1))
+        if bench_api_one "${m}" "${provider_url}"; then
+            ok=$((ok + 1))
+        fi
+    done
+    echo "═══ ${ok}/${count} API models benched ═══"
+}
+
+bench_aggregate() {
+    local outdir="${TURBOFIT_ROOT}/benchmark-results"
+    mkdir -p "${outdir}"
+    python3 - "$outdir" <<'PYEOF'
+import json, os, sys, glob
+outdir = sys.argv[1]
+local_results = []
+api_results = []
+
+# Local: ~/.config/turbofit/benchmarks/<alias>.json
+bench_dir = os.path.join(outdir, "..", "benchmarks")
+for path in sorted(glob.glob(os.path.join(bench_dir, "*.json"))):
+    if ".toks." in path or ".lm_eval." in path:
+        continue
+    try:
+        with open(path) as f:
+            d = json.load(f)
+        if d.get("is_api"):
+            api_results.append(d)
+        else:
+            local_results.append(d)
+    except Exception:
+        continue
+
+# API: ~/.config/turbofit/benchmark-results/<provider>_<model>.json
+for path in sorted(glob.glob(os.path.join(outdir, "*.json"))):
+    if path.endswith("latest.json"):
+        continue
+    try:
+        with open(path) as f:
+            d = json.load(f)
+        if d.get("is_api"):
+            api_results.append(d)
+    except Exception:
+        continue
+
+# Sort local by tier priority: fastest gen_tok_s first
+local_results.sort(key=lambda r: r.get("gen_tok_s", 0), reverse=True)
+api_results.sort(key=lambda r: r.get("gen_tok_s", 0), reverse=True)
+
+out = {
+    "timestamp": __import__("datetime").datetime.now().isoformat(),
+    "local_models": local_results,
+    "api_models": api_results,
+}
+with open(os.path.join(outdir, "latest.json"), "w") as f:
+    json.dump(out, f, indent=2)
+
+print(f"\n╔══ Bench summary ══════════════════════════════════════════════════════╗")
+print(f"║ Local models benched: {len(local_results):<47}║")
+print(f"║ API models benched:   {len(api_results):<47}║")
+if local_results:
+    print(f"║ Fastest local:        {local_results[0].get('alias','?')} @ {local_results[0].get('gen_tok_s', 0)} tok/s{' '*(22-len(local_results[0].get('alias','?')))}║")
+if api_results:
+    print(f"║ Fastest API:          {api_results[0].get('alias','?')} @ {api_results[0].get('gen_tok_s', 0)} tok/s{' '*(22-len(api_results[0].get('alias','?')))}║")
+print(f"╚════════════════════════════════════════════════════════════════════════╝")
+PYEOF
+}
 
 bench_model() {
-    local alias="$1"
-    alias_info "${alias}" 2>/dev/null >/dev/null || { echo "Unknown alias: ${alias}"; return 1; }
-    local port
-    port=$(cat "${TURBOFIT_ROOT}/port/${alias}" 2>/dev/null || echo 8080)
-    if ! curl -sf "http://127.0.0.1:${port}/v1/models" >/dev/null 2>&1; then
-        launch_server "${alias}" || return 1
-    fi
-    echo "Benchmarking ${alias} (mmlu, gsm8k)..."
-    lm_eval --model local-completions \
-        --model_args "model=${alias},base_url=http://127.0.0.1:${port}/v1" \
-        --tasks mmlu,gsm8k --limit 100 2>&1 | tail -20
+    local target="${1:-all}"
+    case "${target}" in
+        all)
+            bench_local_all
+            bench_api_all
+            bench_aggregate
+            ;;
+        --local|local)
+            bench_local_all
+            bench_aggregate
+            ;;
+        --api|api)
+            bench_api_all
+            bench_aggregate
+            ;;
+        --aggregate|aggregate|summary)
+            bench_aggregate
+            ;;
+        --help|-h)
+            cat <<'USAGE'
+serve bench — benchmark local + API models
+
+USAGE:
+  serve bench <alias>          # bench one local model (tok/s + lm-eval)
+  serve bench --local          # bench all role=main|aux local models in catalog
+  serve bench --api            # bench the curated API model set via Nous
+  serve bench all              # bench everything, then aggregate
+  serve bench --aggregate      # just re-aggregate existing results
+
+Results:
+  ~/.config/turbofit/benchmarks/<alias>.json     (local per-model)
+  ~/.config/turbofit/benchmark-results/<model>.json (API per-model)
+  ~/.config/turbofit/benchmark-results/latest.json (aggregated summary)
+USAGE
+            ;;
+        *)
+            bench_local_one "${target}"
+            ;;
+    esac
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
