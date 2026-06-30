@@ -115,6 +115,21 @@ def backend_state(port):
 
 # ─── Backend resolvers ────────────────────────────────────────────────────────
 
+def _get_api_key(provider):
+    """Read the API key for a provider from ~/.hermes/auth.json."""
+    if not provider:
+        return None
+    auth_file = os.path.join(HERMES_HOME, "auth.json")
+    try:
+        with open(auth_file) as f:
+            auth = json.load(f)
+        # Strip "custom:" prefix if present
+        prov_key = provider.replace("custom:", "") if provider.startswith("custom:") else provider
+        return auth.get("providers", {}).get(prov_key, {}).get("access_token")
+    except Exception:
+        return None
+
+
 def _find_api_fallback_in_profiles():
     """Search every profile's config + the global config for an API endpoint.
 
@@ -149,7 +164,7 @@ def _find_api_fallback_in_profiles():
                 continue
             return {
                 "alias": "api-fallback",
-                "base_url": url.rstrip("/v1").rstrip("/"),
+                "base_url": url.rstrip("/").removesuffix("/v1").rstrip("/"),
                 "port": 0,
                 "is_api": True,
                 "model_id": default,
@@ -409,12 +424,24 @@ class GatewayHandler(BaseHTTPRequestHandler):
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length) if content_length > 0 else None
         headers = {k: v for k, v in self.headers.items()
-                   if k.lower() not in ("host", "transfer-encoding", "content-length", "content-encoding")}
+                   if k.lower() not in ("host", "transfer-encoding", "content-length", "content-encoding",
+                                        "authorization")}  # we re-inject auth below
 
-        # For local backends, inject the model id header (llama-server doesn't care,
-        # but OpenAI-compatible APIs and the chat completions endpoint do require it).
-        # We don't actually mutate the JSON body here — we trust the caller sent
-        # the right model name. We just record the alias in an X- header for debugging.
+        # API fallback: rewrite the model field + inject the real API key.
+        # The caller (Hermes) sent a local model name (e.g. Darwin-28B-REASON.Q4_K_M.gguf)
+        # and a dummy "not-needed" key. The API needs its own model id + bearer token.
+        if backend.get("is_api"):
+            model_id = backend.get("model_id")
+            if model_id and body:
+                try:
+                    payload = json.loads(body)
+                    payload["model"] = model_id
+                    body = json.dumps(payload).encode()
+                except Exception:
+                    pass
+            api_key = _get_api_key(backend.get("provider"))
+            if api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
 
         req = Request(target, data=body, headers=headers, method=self.command)
         start = time.time()
