@@ -1,0 +1,3525 @@
+#!/usr/bin/env bash
+# serve — turbofit model launcher + Hermes-Agent config manager
+# Part of the turbofit skill: github.com/SouthpawIN/turbofit
+#
+# v5.0.0: opinionated unified backend.
+#   - Extended catalog schema (mmproj, gpu, presets, extra_args, tier, featured, etc.)
+#   - Named flag presets (nextn, draft-mtp, turbo4-kv, vision-mmproj, no-mmap)
+#   - Scaling ladder (serve auto / serve downscale) — probes VRAM, shrinks ctx,
+#     drops aux, swaps tier, offloads experts
+#   - Opinionated defaults: 64K ctx floor, 25 tok/s target, vision if possible,
+#     tier ladder s → f → c
+#
+# Backwards compatible with v4 (catalog extends schema, not replaces).
+
+set -euo pipefail
+
+TURBOFIT_ROOT="${TURBOFIT_ROOT:-${HOME}/.local/share/turbofit}"
+TURBOFIT_CONFIG_DIR="${HOME}/.config/turbofit"
+CATALOG="${TURBOFIT_CONFIG_DIR}/models.yaml"
+CURATED="${TURBOFIT_CONFIG_DIR}/curated.yaml"
+
+# Resolve Hermes config path — works on standard, profile, and Docker installs
+if [ -n "${HERMES_HOME:-}" ]; then
+    HERMES_CONFIG="${HERMES_HOME}/config.yaml"
+else
+    HERMES_CONFIG="${HOME}/.hermes/config.yaml"
+fi
+NVIDIA_API_BASE="https://integrate.api.nvidia.com/v1"
+
+mkdir -p "${TURBOFIT_ROOT}"/{logs,pid,port,strings,launchers} "${TURBOFIT_CONFIG_DIR}"
+
+# Export paths for embedded Python heredocs
+export TURBOFIT_CATALOG="${CATALOG}"
+export TURBOFIT_CURATED="${CURATED}"
+export TURBOFIT_HERMES_CONFIG="${HERMES_CONFIG}"
+
+# Bootstrap empty catalog + curated slots if missing (first run)
+if [ ! -f "${CATALOG}" ]; then
+    cat > "${CATALOG}" <<'YAML'
+# turbofit model catalog
+# Register models with: serve register <alias> <path> [--launcher llama-cpp] [--port N]
+# Or edit this file directly.
+# Schema: https://github.com/SouthpawIN/turbofit#catalog-schema
+models: {}
+YAML
+fi
+
+if [ ! -f "${CURATED}" ]; then
+    cat > "${CURATED}" <<'YAML'
+# turbofit curated slots — used by `serve auto` to pick models
+# Each slot has tier keys (s/sf/sd/f/c) with lists of entries.
+# Edit to match your local models and API preferences.
+slots:
+  # LOCAL MAIN — your GPU models, ranked by tier
+  main_local:
+    description: Local main — runs on your GPU. Register models with `serve register`.
+    # Uncomment and set to your models:
+    # s:
+    # - alias: my-27b-model
+    #   why: Smartest model I have
+    #   tok_s_target: 38
+    #   ctx_target: 262144
+    #   vision: true
+    #   vram_gb: 17
+
+  # LOCAL AUX — secondary model for vision/aux tasks
+  aux_local:
+    description: Local aux — secondary model (vision, compression, etc.)
+    # sd:
+    # - alias: my-35b-moe
+    #   why: MoE 35B/3B-active, vision, 1M ctx
+    #   tok_s_target: 110
+    #   ctx_target: 262144
+    #   vision: true
+    #   vram_gb: 11
+
+  # API MAIN — used when no local GPU or --api flag
+  main_api:
+    description: API main picks — free models first, ranked by reasoning quality.
+    s:
+    - alias: deepseek-v4-pro
+      provider: nvidia-nim
+      model_id: deepseek-ai/deepseek-v4-pro
+      why: Best free reasoning + coding. 1M ctx. Free on NIM.
+      vision: false
+      free: true
+    sf:
+    - alias: deepseek-v4-flash
+      provider: nvidia-nim
+      model_id: deepseek-ai/deepseek-v4-flash
+      why: Fast reasoning, free tier.
+      vision: false
+      free: true
+
+  # API AUX — vision-capable, free first
+  aux_api:
+    description: API aux picks — vision required, free first.
+    sf:
+    - alias: minimax-m3
+      provider: nvidia-nim
+      model_id: minimaxai/minimax-m3
+      why: Free vision model. 1M ctx, image+video.
+      vision: true
+      free: true
+YAML
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OS detection — Linux vs Windows (native, not WSL)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Detects the host OS so daemon management can route through platform-specific
+# backends: systemd user units on Linux, PID files + tasklist/taskkill on Windows.
+# $TURBOFIT_OS is exported so embedded Python heredocs can read it too.
+
+detect_os() {
+    # Allow explicit override via env var
+    if [ -n "${TURBOFIT_OS:-}" ]; then
+        return
+    fi
+    local uname_out=""
+    if command -v uname >/dev/null 2>&1; then
+        uname_out="$(uname -s 2>/dev/null || echo "")"
+    fi
+    case "${uname_out}" in
+        Linux*)         TURBOFIT_OS="linux" ;;
+        MINGW*|MSYS*|CYGWIN*)
+                        TURBOFIT_OS="windows" ;;
+        Darwin*)        TURBOFIT_OS="linux" ;;  # treat macOS as linux-like (no native daemon support either)
+        *)              # Fallback: check $OS env var (Windows sets OS=Windows_NT)
+                        if [ "${OS:-}" = "Windows_NT" ]; then
+                            TURBOFIT_OS="windows"
+                        else
+                            TURBOFIT_OS="linux"
+                        fi
+                        ;;
+    esac
+}
+
+detect_os
+export TURBOFIT_OS
+
+# CPU count — nproc on Linux, fallback for Windows/Git Bash
+if command -v nproc >/dev/null 2>&1; then
+    TF_NPROC="$(nproc)"
+else
+    # Git Bash on Windows doesn't have nproc; use NUMBER_OF_PROCESSORS env var
+    TF_NPROC="${NUMBER_OF_PROCESSORS:-4}"
+fi
+export TF_NPROC
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Platform-specific paths
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# On Linux:   DAEMON_UNIT_DIR = ~/.config/systemd/user  (systemd user units)
+# On Windows: DAEMON_DIR      = ~/.config/turbofit/daemons (PID files + metadata)
+
+if [ "${TURBOFIT_OS}" = "windows" ]; then
+    DAEMON_UNIT_DIR="${HOME}/.config/turbofit/daemons"
+else
+    DAEMON_UNIT_DIR="${HOME}/.config/systemd/user"
+fi
+mkdir -p "${DAEMON_UNIT_DIR}" 2>/dev/null || true
+
+LLAMA_PROXY_BIN="${HOME}/bin/llama-proxy"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Daemon management — platform abstraction layer
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# All systemctl calls in this script route through these wrappers so the same
+# `serve daemon *` commands work on both Linux (systemd) and Windows (PID files).
+#
+# Linux backend:
+#   systemctl --user {is-active|start|stop|status|enable|daemon-reload} turbofit-<alias>.service
+#
+# Windows backend:
+#   PID file at $DAEMON_UNIT_DIR/turbofit-<alias>.pid
+#   Process liveness via tasklist /FI "PID eq <pid>"
+#   Stop via taskkill /PID <pid> /T /F
+#   Start via the generated launch string + nohup equivalent (background &)
+
+# Returns the PID for a daemon alias (from PID file on Windows, from systemd on Linux).
+# Prints PID to stdout, or empty if not running.
+tf_daemon_pid() {
+    local alias="$1"
+    if [ "${TURBOFIT_OS}" = "windows" ]; then
+        local pid_file="${DAEMON_UNIT_DIR}/turbofit-${alias}.pid"
+        if [ -f "${pid_file}" ]; then
+            local pid
+            pid=$(cat "${pid_file}" 2>/dev/null || echo "")
+            if [ -n "${pid}" ]; then
+                # Check if process is alive via tasklist
+                if tasklist /FI "PID eq ${pid}" 2>/dev/null | grep -q "${pid}"; then
+                    echo "${pid}"
+                    return 0
+                else
+                    # Stale PID file — clean it up
+                    rm -f "${pid_file}" 2>/dev/null || true
+                fi
+            fi
+        fi
+        echo ""
+        return 1
+    else
+        # Linux: get MainPID from systemd
+        systemctl --user show -p MainPID "turbofit-${alias}.service" 2>/dev/null | cut -d= -f2
+    fi
+}
+
+# Check if a daemon is active (running). Returns 0 if active, 1 otherwise.
+tf_daemon_is_active() {
+    local alias="$1"
+    if [ "${TURBOFIT_OS}" = "windows" ]; then
+        local pid
+        pid=$(tf_daemon_pid "${alias}" 2>/dev/null || echo "")
+        [ -n "${pid}" ] && return 0
+        return 1
+    else
+        systemctl --user is-active "turbofit-${alias}.service" >/dev/null 2>&1
+    fi
+}
+
+# Start a daemon. On Linux: systemctl start. On Windows: the daemon_install
+# function writes a launch script; this runs it in the background.
+tf_daemon_start() {
+    local alias="$1"
+    if [ "${TURBOFIT_OS}" = "windows" ]; then
+        local launcher_script="${DAEMON_UNIT_DIR}/turbofit-${alias}.launch.sh"
+        local log_file="${TURBOFIT_ROOT}/logs/daemon-${alias}.log"
+        if [ ! -f "${launcher_script}" ]; then
+            echo "✗ No daemon for ${alias}. Run: serve daemon install ${alias}"
+            return 1
+        fi
+        # Check if already running
+        if tf_daemon_is_active "${alias}"; then
+            echo "✓ Daemon already running: ${alias}"
+            return 0
+        fi
+        # Launch in background, write PID
+        mkdir -p "${TURBOFIT_ROOT}/logs" "${TURBOFIT_ROOT}/pid"
+        bash "${launcher_script}" > "${log_file}" 2>&1 &
+        local pid=$!
+        echo "${pid}" > "${DAEMON_UNIT_DIR}/turbofit-${alias}.pid"
+        echo "${pid}" > "${TURBOFIT_ROOT}/pid/${alias}"
+        echo "✓ Daemon started: ${alias}"
+    else
+        local unit_name="turbofit-${alias}.service"
+        if [ ! -f "${DAEMON_UNIT_DIR}/${unit_name}" ]; then
+            echo "✗ No daemon for ${alias}. Run: serve daemon install ${alias}"
+            return 1
+        fi
+        systemctl --user start "${unit_name}"
+        echo "✓ Daemon started: ${alias}"
+    fi
+}
+
+# Stop a daemon. On Linux: systemctl stop. On Windows: taskkill.
+tf_daemon_stop() {
+    local alias="$1"
+    if [ "${TURBOFIT_OS}" = "windows" ]; then
+        local pid
+        pid=$(tf_daemon_pid "${alias}" 2>/dev/null || echo "")
+        if [ -n "${pid}" ]; then
+            taskkill /PID "${pid}" /T /F 2>/dev/null || kill "${pid}" 2>/dev/null || true
+            sleep 1
+            kill -9 "${pid}" 2>/dev/null || true
+        fi
+        rm -f "${DAEMON_UNIT_DIR}/turbofit-${alias}.pid" 2>/dev/null || true
+        rm -f "${TURBOFIT_ROOT}/pid/${alias}" 2>/dev/null || true
+        echo "✓ Daemon stopped: ${alias} (backend killed, VRAM freed)"
+    else
+        local unit_name="turbofit-${alias}.service"
+        if [ ! -f "${DAEMON_UNIT_DIR}/${unit_name}" ]; then
+            echo "✗ No daemon for ${alias}"
+            return 1
+        fi
+        systemctl --user stop "${unit_name}"
+        echo "✓ Daemon stopped: ${alias} (backend killed, VRAM freed)"
+    fi
+}
+
+# Restart a daemon.
+tf_daemon_restart() {
+    local alias="$1"
+    if [ "${TURBOFIT_OS}" = "windows" ]; then
+        tf_daemon_stop "${alias}" 2>/dev/null || true
+        sleep 1
+        tf_daemon_start "${alias}"
+    else
+        local unit_name="turbofit-${alias}.service"
+        if [ ! -f "${DAEMON_UNIT_DIR}/${unit_name}" ]; then
+            echo "✗ No daemon for ${alias}"
+            return 1
+        fi
+        systemctl --user restart "${unit_name}"
+        echo "✓ Daemon restarted: ${alias}"
+    fi
+}
+
+# Show daemon status.
+tf_daemon_status() {
+    local alias="$1"
+    if [ "${TURBOFIT_OS}" = "windows" ]; then
+        local pid_file="${DAEMON_UNIT_DIR}/turbofit-${alias}.pid"
+        local launcher_script="${DAEMON_UNIT_DIR}/turbofit-${alias}.launch.sh"
+        if [ ! -f "${launcher_script}" ]; then
+            echo "✗ No daemon for ${alias}"
+            return 1
+        fi
+        local pid state
+        pid=$(tf_daemon_pid "${alias}" 2>/dev/null || echo "")
+        if [ -n "${pid}" ]; then
+            state="running"
+        else
+            state="stopped"
+        fi
+        echo "turbofit-${alias}.daemon"
+        echo "    State: ${state}"
+        echo "    PID:   ${pid:-none}"
+        echo "    Logs:  ${TURBOFIT_ROOT}/logs/daemon-${alias}.log"
+        echo "    Stop:  serve daemon stop ${alias}"
+    else
+        local unit_name="turbofit-${alias}.service"
+        if [ ! -f "${DAEMON_UNIT_DIR}/${unit_name}" ]; then
+            echo "✗ No daemon for ${alias}"
+            return 1
+        fi
+        systemctl --user status "${unit_name}" 2>/dev/null || true
+    fi
+}
+
+# List all turbofit daemons.
+tf_daemon_list() {
+    if [ "${TURBOFIT_OS}" = "windows" ]; then
+        echo "turbofit-managed daemons:"
+        echo ""
+        local found=0
+        for launcher_script in "${DAEMON_UNIT_DIR}"/turbofit-*.launch.sh; do
+            [ -f "${launcher_script}" ] || continue
+            local dalias
+            dalias=$(basename "${launcher_script}")
+            dalias="${dalias#turbofit-}"
+            dalias="${dalias%.launch.sh}"
+            local pid state
+            pid=$(tf_daemon_pid "${dalias}" 2>/dev/null || echo "")
+            if [ -n "${pid}" ]; then
+                state="running"
+            else
+                state="stopped"
+            fi
+            printf "  %-35s  %-10s  PID: %s\n" "${dalias}" "${state}" "${pid:-none}"
+            found=1
+        done
+        if [ "${found}" -eq 0 ]; then
+            echo "  (none installed)"
+        fi
+    else
+        echo "turbofit-managed daemons:"
+        echo ""
+        for unit_path in "${DAEMON_UNIT_DIR}"/turbofit-*.service; do
+            [ -f "${unit_path}" ] || continue
+            local unit_name dalias active enabled proxy_port
+            unit_name=$(basename "${unit_path}")
+            dalias="${unit_name#turbofit-}"
+            dalias="${dalias%.service}"
+            active=$(systemctl --user is-active "${unit_name}" 2>/dev/null || echo "unknown")
+            enabled=$(systemctl --user is-enabled "${unit_name}" 2>/dev/null || echo "unknown")
+            proxy_port=$(grep -oP 'ExecStart=.*?\s+\K\d+' "${unit_path}" | head -1 || echo "?")
+            printf "  %-35s  %-10s  %-8s  :%s\n" "${dalias}" "${active}" "${enabled}" "${proxy_port}"
+        done
+        if [ -z "$(ls "${DAEMON_UNIT_DIR}"/turbofit-*.service 2>/dev/null)" ]; then
+            echo "  (none installed)"
+        fi
+    fi
+}
+
+# Get the port for a daemon alias (from unit file on Linux, launch script on Windows).
+# Prints port number to stdout, or empty if not found.
+tf_daemon_port() {
+    local alias="$1"
+    if [ "${TURBOFIT_OS}" = "windows" ]; then
+        local launcher_script="${DAEMON_UNIT_DIR}/turbofit-${alias}.launch.sh"
+        if [ -f "${launcher_script}" ]; then
+            grep -oE '\-\-port [0-9]+' "${launcher_script}" 2>/dev/null | grep -oE '[0-9]+' | head -1
+        fi
+    else
+        systemctl --user cat "turbofit-${alias}.service" 2>/dev/null \
+            | grep '^ExecStart=' | grep -oE '[0-9]+' | head -1
+    fi
+}
+
+# List all turbofit daemon aliases (one per line, bare alias without turbofit- prefix).
+# Used by stop_all, list_running, and the downscale aux scanner.
+tf_daemon_list_aliases() {
+    if [ "${TURBOFIT_OS}" = "windows" ]; then
+        local launcher_script
+        for launcher_script in "${DAEMON_UNIT_DIR}"/turbofit-*.launch.sh; do
+            [ -f "${launcher_script}" ] || continue
+            local dalias
+            dalias=$(basename "${launcher_script}")
+            dalias="${dalias#turbofit-}"
+            dalias="${dalias%.launch.sh}"
+            echo "${dalias}"
+        done
+    else
+        systemctl --user list-units --all --no-legend 2>/dev/null \
+            | grep -o 'turbofit-[^ ]*\.service' \
+            | sed 's/turbofit-//; s/\.service//' \
+            | sort -u
+    fi
+}
+
+# Remove a daemon (stop + delete unit/launcher).
+tf_daemon_remove() {
+    local alias="$1"
+    if [ "${TURBOFIT_OS}" = "windows" ]; then
+        local launcher_script="${DAEMON_UNIT_DIR}/turbofit-${alias}.launch.sh"
+        if [ ! -f "${launcher_script}" ]; then
+            echo "✗ No turbofit daemon for: ${alias}"
+            echo "  Looking for: ${launcher_script}"
+            return 1
+        fi
+        tf_daemon_stop "${alias}" 2>/dev/null || true
+        rm -f "${launcher_script}" 2>/dev/null || true
+        rm -f "${DAEMON_UNIT_DIR}/turbofit-${alias}.pid" 2>/dev/null || true
+        echo "✓ Daemon removed: ${alias}"
+    else
+        local unit_name="turbofit-${alias}.service"
+        local unit_path="${DAEMON_UNIT_DIR}/${unit_name}"
+        if [ ! -f "${unit_path}" ]; then
+            echo "✗ No turbofit daemon for: ${alias}"
+            echo "  Looking for: ${unit_path}"
+            # Check if there's a legacy service to clean up
+            echo ""
+            echo "  Legacy services to consider removing:"
+            for svc in omni-va llama-darwin llama-proxy-main model-rotation; do
+                if systemctl --user list-unit-files "${svc}.service" 2>/dev/null | grep -q "enabled\|disabled"; then
+                    echo "    ${svc}.service ($(systemctl --user is-active "${svc}.service" 2>/dev/null || echo "unknown"))"
+                fi
+            done
+            return 1
+        fi
+        # Stop + disable
+        systemctl --user stop "${unit_name}" 2>/dev/null || true
+        systemctl --user disable "${unit_name}" 2>/dev/null || true
+        # Remove the unit file
+        rm -f "${unit_path}"
+        systemctl --user daemon-reload
+        echo "✓ Daemon removed: ${alias}"
+    fi
+}
+
+# Migrate a legacy service to a turbofit daemon (Linux-only concept).
+tf_daemon_migrate() {
+    local service_name="$1"
+    local alias="$2"
+    if [ "${TURBOFIT_OS}" = "windows" ]; then
+        echo "✗ Daemon migration is a Linux-only feature (legacy systemd services)."
+        echo "  On Windows, just run: serve daemon install ${alias}"
+        return 1
+    fi
+    if [ -z "${alias}" ]; then
+        # Try to infer alias from service name
+        case "${service_name}" in
+            omni-va)          alias="carnice-apex" ;;
+            llama-darwin)     alias="darwin-28b-reason" ;;
+            llama-proxy-main) alias="carnice-apex-compact" ;;
+            *)                echo "✗ Specify target alias: serve daemon migrate <legacy-service> <alias>"; return 1 ;;
+        esac
+    fi
+    echo "→ Migrating ${service_name}.service → turbofit-${alias}.service"
+    systemctl --user stop "${service_name}.service" 2>/dev/null || true
+    systemctl --user disable "${service_name}.service" 2>/dev/null || true
+    daemon_install "${alias}"
+    echo ""
+    echo "  Legacy service ${service_name}.service is stopped+disabled."
+    echo "  To fully remove it: rm ${DAEMON_UNIT_DIR}/${service_name}.service && systemctl --user daemon-reload"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Binary resolution — append .exe on Windows if needed
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Called with a binary path/name. On Windows, if it doesn't end in .exe and
+# isn't found as-is, try appending .exe. On Linux, pass through unchanged.
+
+tf_resolve_binary() {
+    local binary="$1"
+    [ -z "${binary}" ] && binary="llama-server"
+    if [ "${TURBOFIT_OS}" = "windows" ]; then
+        # If it already ends in .exe, leave it
+        case "${binary}" in
+            *.exe) : ;;
+            *)
+                # Try as-is first (might be in PATH as llama-server.cmd or similar)
+                if ! command -v "${binary}" >/dev/null 2>&1; then
+                    # Try appending .exe
+                    if command -v "${binary}.exe" >/dev/null 2>&1; then
+                        binary="${binary}.exe"
+                    fi
+                fi
+                ;;
+        esac
+    fi
+    echo "${binary}"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Launcher registry
+# ─────────────────────────────────────────────────────────────────────────────
+
+declare -A LAUNCHER_NAME=(
+    [llama-cpp]="llama.cpp (ggerganov)"
+    [ollama]="Ollama"
+    [vllm]="vLLM"
+    [sglang]="SGlang"
+)
+
+declare -A LAUNCHER_INSTALL=(
+    [llama-cpp]="llama.cpp:git_clone"
+    [ollama]="ollama:curl_install"
+    [vllm]="vllm:pip_install"
+    [sglang]="sglang:pip_install"
+)
+
+declare -A LAUNCHER_TEMPLATE=(
+    [llama-cpp]='"$BINARY" -m "$MODEL_PATH" --host "$HOST" --port "$PORT" -ngl "$NGL" -fa on -c "$CTX" --jinja'
+    [ollama]='OLLAMA_HOST="$HOST:$PORT" ollama serve'
+    [vllm]='vllm serve "$MODEL_PATH" --host "$HOST" --port "$PORT" --max-model-len "$CTX" --gpu-memory-utilization 0.9'
+    [sglang]='python -m sglang.launch_server --model-path "$MODEL_PATH" --host "$HOST" --port "$PORT" --context-length "$CTX" --tp 1'
+)
+
+declare -A LAUNCHER_URL=(
+    [llama-cpp]='http://$HOST:$PORT/v1'
+    [ollama]='http://$HOST:$PORT/v1'
+    [vllm]='http://$HOST:$PORT/v1'
+    [sglang]='http://$HOST:$PORT/v1'
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Named flag presets (opinionated bundles per spec-decoding / KV-cache / etc.)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Apply by listing `presets: [nextn, turbo4-kv]` in the catalog entry.
+# Order matters; later presets can override earlier flags.
+
+declare -A PRESET_FLAGS=(
+    # Spec decoding
+    [nextn]='--spec-type nextn --draft-block-size 3'
+    [nextn-tight]='--spec-type nextn --draft-block-size 2'
+    [draft-mtp]='--spec-type draft-mtp'
+    [draft-mtp-tight]='--spec-type draft-mtp --draft-block-size 2'
+
+    # KV cache quantization (TurboQuant fork variants)
+    [turbo4-kv]='-ctk turbo4 -ctv turbo4'
+    [turbo3-kv]='-ctk turbo3 -ctv turbo3'
+    [turbo2-kv]='-ctk turbo2 -ctv turbo2'
+    [q8-kv]='-ctk q8_0 -ctv q8_0'
+    [q4-kv]='-ctk q4_0 -ctv q4_0'
+
+    # Stability / single-GPU
+    [no-mmap]='--no-mmap'
+    [split-none]='--split-mode none'
+    [mlock]='--mlock'
+    [parallel-4]='--parallel 4'
+    [parallel-2]='--parallel 2'
+    [parallel-1]='--parallel 1'
+
+    # MoE expert offload
+    [cpu-moe-2]='--n-cpu-moe 2'
+    [cpu-moe-4]='--n-cpu-moe 4'
+    [cpu-moe-8]='--n-cpu-moe 8'
+    # Multi-GPU tensor split: use extra_args: ['--tensor-split', 'X,Y'] in catalog
+
+    # GPU selection is handled by the catalog `gpu:` field, not a flag preset
+    # (kept `gpu0`/`gpu1` preset names as no-op aliases for backwards compat)
+
+    # Vision / multimodal — handled by `mmproj:` field, not a flag
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NVIDIA NIM curated API list (verified 2026-06-22)
+# ─────────────────────────────────────────────────────────────────────────────
+
+NVIDIA_NIM_FILE="${TURBOFIT_ROOT}/nvidia-nim-curated.yaml"
+export TURBOFIT_NIM_FILE="${NVIDIA_NIM_FILE}"
+
+write_nvidia_nim_list() {
+    cat > "${NVIDIA_NIM_FILE}" <<'YAML'
+# Southpaw's NVIDIA NIM curated list (verified 2026-06-22 via build.nvidia.com)
+# Rank 1 = best main, 5 = worst. Aux column is the recommended auxiliary.
+# Use `serve api <rank>` or `serve api <api_id>` to switch.
+provider: nvidia-nim
+base_url: https://integrate.api.nvidia.com/v1
+api_key_env: NVIDIA_API_KEY
+context_length: 1000000
+models:
+  - rank: 1
+    name: DeepSeek V4 Pro
+    api_id: deepseek-ai/deepseek-v4-pro
+    aux: MiniMax M3
+    has_vision: false
+    is_free: true
+    price_input: 0.0
+    price_output: 0.0
+    notes: Strongest reasoning + coding. Best main pick. Free endpoint.
+  - rank: 2
+    name: GLM 5.1
+    api_id: z-ai/glm-5.1
+    aux: MiniMax M3
+    has_vision: false
+    is_free: true
+    price_input: 0.0
+    price_output: 0.0
+    notes: Agentic + long-horizon reasoning flagship. Free endpoint.
+  - rank: 3
+    name: DeepSeek V4 Flash
+    api_id: deepseek-ai/deepseek-v4-flash
+    aux: Step 3.5 Flash
+    has_vision: false
+    is_free: true
+    price_input: 0.0
+    price_output: 0.0
+    notes: Fast reasoning, free tier. Cheapest main option.
+  - rank: 4
+    name: MiniMax M3
+    api_id: minimaxai/minimax-m3
+    aux: Step 3.5 Flash
+    has_vision: true
+    is_free: true
+    price_input: 0.0
+    price_output: 0.0
+    notes: Multimodal MoE; 1M ctx, image+video support. Free endpoint. Best free vision model.
+  - rank: 5
+    name: Nemotron Ultra
+    api_id: nvidia/nemotron-3-ultra-550b-a55b
+    aux: MiniMax M3
+    has_vision: true
+    is_free: true
+    price_input: 0.0
+    price_output: 0.0
+    notes: NVIDIA flagship; reasoning budget 16384. Free endpoint.
+YAML
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# llama.cpp management
+# ─────────────────────────────────────────────────────────────────────────────
+
+ensure_llama_cpp() {
+    if ! command -v llama-server >/dev/null 2>&1; then
+        install_launcher llama-cpp
+    fi
+}
+
+install_launcher() {
+    local which="$1"
+    case "${which}" in
+        llama-cpp)
+            local src="${HOME}/.local/src/llama.cpp"
+            local prefix="${HOME}/.local"
+            mkdir -p "${src%/*}"
+            if [ ! -d "${src}/.git" ]; then
+                echo "Cloning llama.cpp..."
+                git clone https://github.com/ggerganov/llama.cpp.git "${src}"
+            fi
+            cd "${src}"
+            git pull --rebase --autostash 2>/dev/null || git pull --rebase
+            cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON \
+                -DCMAKE_INSTALL_PREFIX="${prefix}"
+            cmake --build build --config Release -j"$(nproc)"
+            cmake --install build
+            export PATH="${prefix}/bin:${PATH}"
+            echo "✓ llama.cpp installed"
+            ;;
+        ollama)
+            echo "Installing Ollama..."
+            curl -fsSL https://ollama.com/install.sh | sh
+            echo "✓ Ollama installed"
+            ;;
+        vllm)
+            echo "Installing vllm (pip)..."
+            pip install -U vllm
+            echo "✓ vllm installed"
+            ;;
+        sglang)
+            echo "Installing SGlang (pip)..."
+            pip install -U "sglang[all]"
+            echo "✓ SGlang installed"
+            ;;
+        *)
+            echo "✗ Unknown launcher: ${which}"
+            echo "  Supported: ${!LAUNCHER_NAME[*]}"
+            return 1
+            ;;
+    esac
+}
+
+update_llama_cpp() {
+    local src="${HOME}/.local/src/llama.cpp"
+    if [ ! -d "${src}/.git" ]; then
+        install_launcher llama-cpp
+        return
+    fi
+    echo "Updating llama.cpp..."
+    cd "${src}"
+    git fetch origin
+    git pull --rebase --autostash 2>/dev/null || git pull --rebase
+    cmake --build build --config Release -j"$(nproc)"
+    cmake --install build
+    echo "✓ llama.cpp updated"
+}
+
+update_all_launchers() {
+    local target="${1:-all}"
+    if [ "${target}" = "all" ]; then
+        for l in "${!LAUNCHER_NAME[@]}"; do
+            echo "--- Updating ${l} ---"
+            case "${l}" in
+                llama-cpp) update_llama_cpp ;;
+                ollama)    install_launcher ollama ;;
+                vllm)      pip install -U vllm ;;
+                sglang)    pip install -U "sglang[all]" ;;
+            esac
+        done
+    else
+        case "${target}" in
+            llama-cpp) update_llama_cpp ;;
+            ollama)    install_launcher ollama ;;
+            vllm)      pip install -U vllm ;;
+            sglang)    pip install -U "sglang[all]" ;;
+            *) echo "Unknown launcher: ${target}"; return 1 ;;
+        esac
+    fi
+}
+
+check_llama_cpp() {
+    local binary_version
+    binary_version=$(llama-server --version 2>/dev/null | head -1 || echo "not in PATH")
+    echo "llama.cpp: ${binary_version}"
+    local src="${HOME}/.local/src/llama.cpp"
+    if [ -d "${src}/.git" ]; then
+        local current remote
+        current=$(cd "${src}" && git rev-parse --short HEAD)
+        remote=$(cd "${src}" && git rev-parse --short origin/master 2>/dev/null) || remote="unknown"
+        echo "  local commit:  ${current}"
+        echo "  remote commit: ${remote}"
+        [ "${current}" != "${remote}" ] && echo "  status: OUT OF DATE — run 'serve update'" || echo "  status: up to date"
+    fi
+    echo ""
+    echo "Other launchers:"
+    for l in ollama vllm sglang; do
+        local ver="missing"
+        command -v "${l}" >/dev/null 2>&1 && ver="$(${l} --version 2>&1 | head -1 || echo 'present')"
+        printf "  %-10s %s\n" "${l}:" "${ver}"
+    done
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Hardware fit check
+# ─────────────────────────────────────────────────────────────────────────────
+
+check_fit() {
+    local model_ref="$1"
+    local requested_ctx="${2:-65536}"
+    if ! command -v llmfit >/dev/null 2>&1; then
+        echo "llmfit not installed. Run: pip install -U llmfit"
+        return 1
+    fi
+    llmfit plan "${model_ref}" --context "${requested_ctx}" --json
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# VRAM probe (live, not llmfit)
+# ─────────────────────────────────────────────────────────────────────────────
+
+probe_vram() {
+    # Returns: total_MiB free_MiB gpu_count gpu0_free gpu1_free
+    python3 - <<'PYEOF'
+import subprocess, json, sys
+try:
+    out = subprocess.check_output(
+        ["nvidia-smi", "--query-gpu=index,memory.used,memory.total",
+         "--format=csv,noheader,nounits"],
+        timeout=5
+    ).decode().strip().splitlines()
+    gpus = []
+    total_used = 0
+    total_cap = 0
+    per_gpu_free = []
+    for line in out:
+        idx, used, cap = [int(x.strip()) for x in line.split(",")]
+        gpus.append((idx, used, cap))
+        total_used += used
+        total_cap += cap
+        per_gpu_free.append(cap - used)
+    total_free = total_cap - total_used
+    print(json.dumps({
+        "gpu_count": len(gpus),
+        "total_MiB": total_cap,
+        "used_MiB": total_used,
+        "free_MiB": total_free,
+        "free_GB": round(total_free / 1024, 1),
+        "per_gpu_free_MiB": per_gpu_free,
+    }))
+except Exception as e:
+    print(json.dumps({"error": str(e)}), file=sys.stderr)
+    sys.exit(1)
+PYEOF
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Alias lookup (extended schema)
+# ─────────────────────────────────────────────────────────────────────────────
+
+alias_info() {
+    local alias="$1"
+    python3 - "$alias" <<'PYEOF'
+import sys, os, yaml
+alias = sys.argv[1]
+catalog = os.environ.get("TURBOFIT_CATALOG", os.path.expanduser("~/.config/turbofit/models.yaml"))
+if not os.path.exists(catalog):
+    print("", file=sys.stderr); sys.exit(1)
+with open(catalog) as f:
+    cfg = yaml.safe_load(f) or {}
+models = cfg.get("models", {})
+
+# Resolve alias
+m = models.get(alias)
+if not m:
+    for canonical, info in models.items():
+        if alias in (info.get("aliases") or []):
+            m = info
+            alias = canonical
+            break
+if not m:
+    print("", file=sys.stderr); sys.exit(1)
+
+print(m.get("launcher", "llama-cpp"),
+      m.get("path", ""),
+      m.get("port", 8080),
+      m.get("ctx", 65536))
+PYEOF
+}
+
+alias_full() {
+    local alias="$1"
+    python3 - "$alias" <<'PYEOF'
+import sys, os, yaml, json
+alias = sys.argv[1]
+catalog = os.environ.get("TURBOFIT_CATALOG", os.path.expanduser("~/.config/turbofit/models.yaml"))
+if not os.path.exists(catalog):
+    print("{}", file=sys.stderr); sys.exit(1)
+with open(catalog) as f:
+    cfg = yaml.safe_load(f) or {}
+models = cfg.get("models", {})
+m = models.get(alias)
+if not m:
+    for canonical, info in models.items():
+        if alias in (info.get("aliases") or []):
+            m = info; alias = canonical; break
+if not m:
+    print("{}", file=sys.stderr); sys.exit(1)
+print(json.dumps({"alias": alias, **m}))
+PYEOF
+}
+
+alias_exists() {
+    [ -n "$(alias_info "$1" 2>/dev/null)" ]
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Generate launch string — extended
+# ─────────────────────────────────────────────────────────────────────────────
+
+resolve_extra_args() {
+    local alias="$1"
+    python3 - "$alias" <<'PYEOF'
+import sys, os, yaml
+alias = sys.argv[1]
+catalog = os.environ.get("TURBOFIT_CATALOG", os.path.expanduser("~/.config/turbofit/models.yaml"))
+if not os.path.exists(catalog):
+    sys.exit(0)
+with open(catalog) as f:
+    cfg = yaml.safe_load(f) or {}
+models = cfg.get("models", {})
+m = models.get(alias)
+if not m:
+    for canonical, info in models.items():
+        if alias in (info.get("aliases") or []):
+            m = info; break
+if not m:
+    sys.exit(0)
+
+# 1) explicit extra_args first (raw flag list)
+for a in (m.get("extra_args") or []):
+    print(a)
+
+# 2) named presets — resolve to flag strings
+for p in (m.get("presets") or []):
+    # Resolve preset names via shell-side PRESET_FLAGS (we'll pass through below)
+    print(f"__PRESET__{p}")
+
+# 3) GPU selection (from catalog `gpu:` field)
+gpu = m.get("gpu")
+if gpu is not None:
+    print(f"--main-gpu {gpu}")
+
+# 4) mmproj
+if m.get("mmproj"):
+    print(f"--mmproj {m['mmproj']}")
+
+# 5) parallel override
+if m.get("parallel"):
+    print(f"--parallel {m['parallel']}")
+
+# 6) binary hint (only emitted as a marker — resolved in shell)
+if m.get("binary"):
+    print(f"__BINARY__{m['binary']}")
+PYEOF
+}
+
+generate_string() {
+    local alias="$1"
+    local info launcher path port ctx
+    info=$(alias_info "${alias}")
+    [ -z "${info}" ] && { echo "✗ Unknown alias: ${alias}"; return 1; }
+    launcher=$(echo "${info}" | awk '{print $1}')
+    path=$(echo "${info}"     | awk '{print $2}')
+    port=$(echo "${info}"     | awk '{print $3}')
+    ctx=$(echo "${info}"      | awk '{print $4}')
+    ctx=$(( ctx < 65536 ? 65536 : ctx ))
+
+    local host="127.0.0.1"
+    local ngl=99
+
+    # Look up catalog binary hint
+    local binary=""
+    local catalog_json
+    catalog_json=$(alias_full "${alias}" 2>/dev/null || true)
+    if [ -n "${catalog_json}" ]; then
+        binary=$(echo "${catalog_json}" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('binary','') or '')" 2>/dev/null || echo "")
+    fi
+    if [ -z "${binary}" ]; then
+        binary="llama-server"
+    fi
+
+    # Resolve binary (append .exe on Windows if needed)
+    binary=$(tf_resolve_binary "${binary}")
+
+    case "${launcher}" in
+        llama-cpp)
+            echo "# turbofit launch string for ${alias}"
+            echo "# $(alias_full "${alias}" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('description',''))" 2>/dev/null || true)"
+            echo "# binary: ${binary}"
+            echo "${binary} \\"
+            echo "  -m \"${path}\" \\"
+            echo "  --host ${host} --port ${port} \\"
+            echo "  -ngl ${ngl} -fa on \\"
+            echo "  -c ${ctx} \\"
+            echo "  --jinja \\"
+            echo "  -t ${TF_NPROC} \\"
+            # Inject resolved extras (presets + extra_args + mmproj + gpu)
+            local extras
+            extras=$(resolve_extra_args "${alias}" 2>/dev/null || true)
+            local in_extras=0
+            while IFS= read -r line; do
+                [[ -z "${line}" ]] && continue
+                if [[ "${line}" == __PRESET__* ]]; then
+                    local pname="${line#__PRESET__}"
+                    if [[ -n "${PRESET_FLAGS[${pname}]-}" ]] && [[ -n "${PRESET_FLAGS[${pname}]}" ]]; then
+                        echo "  ${PRESET_FLAGS[${pname}]} \\"
+                    fi
+                elif [[ "${line}" == __BINARY__* ]]; then
+                    : # binary already emitted in header
+                else
+                    echo "  ${line} \\"
+                fi
+            done <<< "${extras}"
+            echo "  # end turbofit"
+            ;;
+        ollama)
+            cat <<EOF
+# Pull the model first (one-time)
+ollama pull ${path}
+
+# Launch Ollama server
+OLLAMA_HOST="${host}:${port}" ollama serve
+EOF
+            ;;
+        vllm)
+            cat <<EOF
+vllm serve ${path} \\
+  --host ${host} \\
+  --port ${port} \\
+  --max-model-len ${ctx} \\
+  --gpu-memory-utilization 0.9 \\
+  --served-model-name ${alias}
+EOF
+            ;;
+        sglang)
+            cat <<EOF
+python -m sglang.launch_server \\
+  --model-path ${path} \\
+  --host ${host} \\
+  --port ${port} \\
+  --context-length ${ctx} \\
+  --served-model-name ${alias} \\
+  --tp 1
+EOF
+            ;;
+    esac
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Server lifecycle
+# ─────────────────────────────────────────────────────────────────────────────
+
+launch_server() {
+    local alias="$1"
+    local info launcher path port ctx
+    info=$(alias_info "${alias}")
+    [ -z "${info}" ] && { echo "✗ Unknown alias: ${alias}"; return 1; }
+    launcher=$(echo "${info}" | awk '{print $1}')
+    path=$(echo "${info}"     | awk '{print $2}')
+    port=$(echo "${info}"     | awk '{print $3}')
+    ctx=$(echo "${info}"      | awk '{print $4}')
+
+    # Kill any existing process on this port (or tracked alias)
+    if [ -f "${TURBOFIT_ROOT}/pid/${alias}" ]; then
+        local old_pid
+        old_pid=$(cat "${TURBOFIT_ROOT}/pid/${alias}")
+        if kill -0 "${old_pid}" 2>/dev/null; then
+            echo "Stopping existing ${alias} (pid ${old_pid})..."
+            kill "${old_pid}" 2>/dev/null || true
+            sleep 1
+            kill -9 "${old_pid}" 2>/dev/null || true
+        fi
+        rm -f "${TURBOFIT_ROOT}/pid/${alias}" "${TURBOFIT_ROOT}/port/${alias}"
+    fi
+
+    # Look up catalog binary hint
+    local binary=""
+    local catalog_json
+    catalog_json=$(alias_full "${alias}" 2>/dev/null || true)
+    if [ -n "${catalog_json}" ]; then
+        binary=$(echo "${catalog_json}" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('binary','') or '')" 2>/dev/null || echo "")
+    fi
+    if [ -z "${binary}" ]; then
+        binary="llama-server"
+    fi
+
+    # Resolve binary (append .exe on Windows if needed)
+    binary=$(tf_resolve_binary "${binary}")
+
+    local cmd_file="${TURBOFIT_ROOT}/strings/${alias}.sh"
+    generate_string "${alias}" > "${cmd_file}"
+    chmod +x "${cmd_file}"
+
+    local log_file="${TURBOFIT_ROOT}/logs/${alias}.log"
+    local host="127.0.0.1"
+    local ngl=99
+    ctx=$(( ctx < 65536 ? 65536 : ctx ))
+
+    # Resolve extras as flat args
+    local extra_args=()
+    local extras
+    extras=$(resolve_extra_args "${alias}" 2>/dev/null || true)
+    while IFS= read -r line; do
+        [[ -z "${line}" ]] && continue
+        if [[ "${line}" == __PRESET__* ]]; then
+            local pname="${line#__PRESET__}"
+            if [[ -n "${PRESET_FLAGS[${pname}]-}" ]] && [[ -n "${PRESET_FLAGS[${pname}]}" ]]; then
+                # shellcheck disable=SC2206
+                extra_args+=(${PRESET_FLAGS[${pname}]})
+            fi
+        elif [[ "${line}" == __BINARY__* ]]; then
+            : # already handled above
+        else
+            # shellcheck disable=SC2206
+            extra_args+=(${line})
+        fi
+    done <<< "${extras}"
+
+    case "${launcher}" in
+        llama-cpp)
+            nohup "${binary}" \
+                -m "${path}" \
+                --host "${host}" --port "${port}" \
+                -ngl "${ngl}" -fa on \
+                -c "${ctx}" \
+                --jinja \
+                -t "$(nproc)" \
+                "${extra_args[@]}" \
+                > "${log_file}" 2>&1 &
+            ;;
+        ollama)
+            OLLAMA_HOST="${host}:${port}" nohup ollama serve > "${log_file}" 2>&1 &
+            ;;
+        vllm)
+            nohup vllm serve "${path}" \
+                --host "${host}" --port "${port}" \
+                --max-model-len "${ctx}" --gpu-memory-utilization 0.9 \
+                --served-model-name "${alias}" "${extra_args[@]}" \
+                > "${log_file}" 2>&1 &
+            ;;
+        sglang)
+            nohup python -m sglang.launch_server \
+                --model-path "${path}" \
+                --host "${host}" --port "${port}" \
+                --context-length "${ctx}" \
+                --served-model-name "${alias}" --tp 1 "${extra_args[@]}" \
+                > "${log_file}" 2>&1 &
+            ;;
+    esac
+
+    disown
+    local pid=$!
+    echo "${pid}" > "${TURBOFIT_ROOT}/pid/${alias}"
+    echo "${port}" > "${TURBOFIT_ROOT}/port/${alias}"
+
+    echo "Launching ${alias} (pid ${pid}) via ${launcher} on :${port}..."
+    for i in $(seq 1 120); do
+        if curl -sf "http://127.0.0.1:${port}/health" >/dev/null 2>&1 || \
+           curl -sf "http://127.0.0.1:${port}/v1/models" >/dev/null 2>&1; then
+            echo ""
+            echo "✓ ${alias} ready"
+            echo ""
+            echo "  Backend: ${launcher}"
+            echo "  Port:   :${port}"
+            echo "  PID:    ${pid}"
+            echo "  Logs:   ${log_file}"
+            echo "  Stop:   serve stop ${alias}"
+            return 0
+        fi
+        if ! kill -0 "${pid}" 2>/dev/null; then
+            echo ""
+            echo "✗ ${alias} died during startup. Tail of log:"
+            tail -20 "${log_file}" 2>/dev/null || true
+            return 1
+        fi
+        sleep 1
+    done
+    echo ""
+    echo "✗ ${alias} did not become healthy within 120s"
+    echo "  Logs: ${log_file}"
+    return 1
+}
+
+stop_server() {
+    local alias="$1"
+    local stopped=0
+    # Try platform daemon first (systemd on Linux, PID file on Windows)
+    if tf_daemon_is_active "${alias}" 2>/dev/null; then
+        tf_daemon_stop "${alias}" 2>/dev/null || true
+        echo "✓ Stopped ${alias} (daemon)"
+        stopped=1
+    fi
+    # Also check PID-file managed servers (direct serve launches)
+    if [ -f "${TURBOFIT_ROOT}/pid/${alias}" ]; then
+        local pid
+        pid=$(cat "${TURBOFIT_ROOT}/pid/${alias}")
+        if kill -0 "${pid}" 2>/dev/null; then
+            kill "${pid}" 2>/dev/null || true
+            sleep 1
+            kill -9 "${pid}" 2>/dev/null || true
+        fi
+        rm -f "${TURBOFIT_ROOT}/pid/${alias}" "${TURBOFIT_ROOT}/port/${alias}"
+        echo "✓ Stopped ${alias} (pid ${pid})"
+        stopped=1
+    fi
+    [ "$stopped" -eq 0 ] && echo "No running server for: ${alias}"
+}
+
+stop_all() {
+    # Stop platform-managed daemons (systemd on Linux, PID-based on Windows)
+    while IFS= read -r alias; do
+        [ -z "${alias}" ] && continue
+        stop_server "${alias}"
+    done < <(tf_daemon_list_aliases 2>/dev/null)
+    # Stop PID-file managed servers (direct serve launches)
+    if [ -d "${TURBOFIT_ROOT}/pid" ]; then
+        for pid_file in "${TURBOFIT_ROOT}/pid"/*; do
+            [ -f "${pid_file}" ] || continue
+            local alias
+            alias=$(basename "${pid_file}")
+            stop_server "${alias}"
+        done
+    fi
+}
+
+list_running() {
+    echo "Running servers:"
+    local found=0
+    # PID-file managed (direct serve launches)
+    if [ -d "${TURBOFIT_ROOT}/pid" ]; then
+        for pid_file in "${TURBOFIT_ROOT}/pid"/*; do
+            [ -f "${pid_file}" ] || continue
+            local alias pid port
+            alias=$(basename "${pid_file}")
+            pid=$(cat "${pid_file}")
+            port=$(cat "${TURBOFIT_ROOT}/port/${alias}" 2>/dev/null || echo "?")
+            if kill -0 "${pid}" 2>/dev/null; then
+                echo "  ${alias}: pid ${pid}, :${port}"
+                found=1
+            else
+                rm -f "${pid_file}"
+            fi
+        done
+    fi
+    # Platform-managed daemons (systemd on Linux, PID-based on Windows)
+    while IFS= read -r alias; do
+        [ -z "${alias}" ] && continue
+        local port state
+        port=$(tf_daemon_port "${alias}" 2>/dev/null || echo "?")
+        if tf_daemon_is_active "${alias}" 2>/dev/null; then
+            state="active"
+        else
+            state="inactive"
+        fi
+        echo "  ${alias}: daemon (${state}), :${port:-?}"
+        found=1
+    done < <(tf_daemon_list_aliases 2>/dev/null)
+    [ "$found" -eq 0 ] && echo "  (none)"
+    # Also scan ports for rogue llama-servers (started manually outside turbofit)
+    echo ""
+    echo "Detected llama-server processes on any port:"
+    for p in $(ss -ltn 2>/dev/null | awk '{print $4}' | grep -oE ':[0-9]+' | tr -d ':' | sort -nu); do
+        if curl -sf --max-time 2 "http://127.0.0.1:${p}/v1/models" >/dev/null 2>&1; then
+            local model_id
+            model_id=$(curl -sf --max-time 2 "http://127.0.0.1:${p}/v1/models" 2>/dev/null \
+                | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['data'][0]['id'] if d.get('data') else '?')" 2>/dev/null || echo "?")
+            echo "  :${p}  →  ${model_id}"
+        fi
+    done
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Scaling ladder — opinionated "serve auto" / "serve downscale"
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Tier ladder:
+#   s-tier  = smartest (e.g. Darwin Reason, DeepSeek V4 Pro)
+#   sf-tier = smartest-fast (Prism Eagle, Qwopus v2-MTP, Darwin Apex)
+#   f-tier  = fastest (Qwopus Coder-MTP)
+#   sd-tier = smart-dense (Carnice Apex Nano, MiniMax M3 API)
+#   c-tier  = cheap (OmniStep-SFT-8B, Nemotron Ultra API)
+#
+# Targets (opinionated):
+#   ctx_floor        = 65536    # Hermes-Agent hard floor
+#   tok_s_floor      = 25       # min acceptable tok/s for main
+#   want_vision      = False    # user flag
+#   want_vision_main = True     # preferred (but optional)
+#
+# Downscale steps (each step tries to free VRAM without dropping tok/s below floor):
+#   1. shrink ctx: 262144 → 131072 → 65536 (floor)
+#   2. drop aux (free the aux model's VRAM)
+#   3. tier swap: s → sf → f
+#   4. swap to MoE: any dense → darwin-apex (MoE, expert offload)
+#   5. expert offload (MoE): --cpu-moe or ngl reduction
+#   6. drop quant: Q4 → Q3 (catalog swap — not auto yet)
+#   7. CPU-only fallback (last resort)
+
+pick_from_curated() {
+    # Walk the curated.yaml slots (main_local → main_api, or aux_local → aux_api)
+    # Pick the highest-tier entry that meets constraints.
+    # Returns: {type: "local"|"api", alias?: str, model_id?: str, provider?: str, base_url?: str, api_key_env?: str, vision?: bool, free?: bool}
+    local role="${1:-main}"
+    local want_vision="${2:-false}"
+    local prefer_free="${3:-false}"
+    python3 - "$role" "$want_vision" "$prefer_free" <<'PYEOF'
+import sys, os, yaml, json
+slot = sys.argv[1]             # "main" or "aux"
+want_vision = sys.argv[2] == "true"
+prefer_free = sys.argv[3] == "true"
+
+curated_path = os.environ.get("TURBOFIT_CURATED", os.path.expanduser("~/.config/turbofit/curated.yaml"))
+catalog_path = os.environ.get("TURBOFIT_CATALOG", os.path.expanduser("~/.config/turbofit/models.yaml"))
+
+if not os.path.exists(curated_path):
+    print(json.dumps({"error": "curated.yaml missing"})); sys.exit(1)
+with open(curated_path) as f:
+    curated = yaml.safe_load(f) or {}
+catalog_models = {}
+if os.path.exists(catalog_path):
+    with open(catalog_path) as f:
+        catalog = yaml.safe_load(f) or {}
+    catalog_models = (catalog or {}).get("models", {})
+
+# Fallback chain: main_local → main_api, aux_local → aux_api
+chain = ["main_local", "main_api"] if slot == "main" else ["aux_local", "aux_api"]
+tier_rank = {"s": 0, "sf": 1, "sd": 2, "f": 3, "c": 4}
+
+def model_path_exists(p):
+    return p and os.path.exists(p)
+
+def meets(entry, vision_required):
+    if vision_required and not entry.get("vision", False):
+        return False
+    if prefer_free and entry.get("free") is False:
+        return False
+    return True
+
+# Walk chain, then tiers within each slot
+for slot_key in chain:
+    slot_data = curated.get("slots", {}).get(slot_key, {})
+    entries_by_tier = []  # (tier_rank, idx, entry_dict, entry_kind)
+    for tier_name in ["s", "sf", "sd", "f", "c"]:
+        for idx, e in enumerate(slot_data.get(tier_name, [])):
+            entries_by_tier.append((tier_rank[tier_name], idx, e, "local" if "local" in slot_key else "api"))
+
+    entries_by_tier.sort(key=lambda x: (x[0], x[1]))
+
+    for tr, idx, e, kind in entries_by_tier:
+        if not meets(e, want_vision):
+            continue
+        if kind == "local":
+            alias = e.get("alias")
+            if not alias:
+                continue
+            m = catalog_models.get(alias, {})
+            if not m:
+                continue
+            path = m.get("path", "")
+            if not model_path_exists(path):
+                continue
+            print(json.dumps({
+                "type": "local",
+                "slot": slot_key,
+                "tier": ["s","sf","sd","f","c"][tr],
+                "alias": alias,
+                "path": path,
+                "port": m.get("port"),
+                "ctx": m.get("ctx"),
+                "binary": m.get("binary"),
+                "vision": e.get("vision", False),
+                "reason": f"{slot_key} tier={['s','sf','sd','f','c'][tr]} ({e.get('why','')[:80]})",
+            }))
+            sys.exit(0)
+        else:  # api
+            print(json.dumps({
+                "type": "api",
+                "slot": slot_key,
+                "tier": ["s","sf","sd","f","c"][tr],
+                "alias": e.get("alias"),
+                "provider": e.get("provider"),
+                "model_id": e.get("model_id"),
+                "vision": e.get("vision", False),
+                "free": e.get("free", False),
+                "reason": f"{slot_key} tier={['s','sf','sd','f','c'][tr]} ({e.get('why','')[:80]})",
+            }))
+            sys.exit(0)
+
+print(json.dumps({"pick": None, "reason": "no candidate met constraints in any slot"}))
+PYEOF
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# API model picker — reads curated.yaml API slots, ranks by tier
+# ─────────────────────────────────────────────────────────────────────────────
+
+pick_api_model() {
+    local role="${1:-main}"
+    local want_vision="${2:-false}"
+    local prefer_free="${3:-false}"
+    python3 - "$role" "$want_vision" "$prefer_free" <<'PYEOF'
+import sys, os, yaml, json
+
+role = sys.argv[1]
+want_vision = sys.argv[2] == "true"
+prefer_free = sys.argv[3] == "true"
+
+curated_path = os.environ.get("TURBOFIT_CURATED", os.path.expanduser("~/.config/turbofit/curated.yaml"))
+if not os.path.exists(curated_path):
+    print(json.dumps({"error": "curated.yaml missing"}))
+    sys.exit(1)
+
+with open(curated_path) as f:
+    curated = yaml.safe_load(f) or {}
+
+slot_key = "main_api" if role == "main" else "aux_api"
+slot_data = curated.get("slots", {}).get(slot_key, {})
+
+tier_rank = {"s": 0, "sf": 1, "sd": 2, "f": 3, "c": 4}
+entries = []
+for tier_name in ["s", "sf", "sd", "f", "c"]:
+    for idx, e in enumerate(slot_data.get(tier_name, [])):
+        entries.append((tier_rank[tier_name], idx, e))
+
+entries.sort(key=lambda x: (x[0], x[1]))
+
+for tr, idx, e in entries:
+    # Vision filter
+    if want_vision and not e.get("vision", False):
+        continue
+    # Free filter
+    if prefer_free and e.get("free") is False:
+        continue
+    print(json.dumps({
+        "type": "api",
+        "slot": slot_key,
+        "tier": ["s","sf","sd","f","c"][tr],
+        "alias": e.get("alias"),
+        "provider": e.get("provider"),
+        "model_id": e.get("model_id"),
+        "vision": e.get("vision", False),
+        "free": e.get("free", False),
+        "price_input": e.get("price_input"),
+        "price_output": e.get("price_output"),
+        "reason": f"{slot_key} tier={['s','sf','sd','f','c'][tr]} ({e.get('why','')[:80]})",
+    }))
+    sys.exit(0)
+
+print(json.dumps({"error": f"no API candidate met constraints for {role}"}))
+PYEOF
+}
+
+wire_hermes_api_main() {
+    local model_id="$1"
+    local base_url="$2"
+    local api_key_env="$3"
+    python3 - <<PYEOF
+import yaml, os
+cfg_path = "${HERMES_CONFIG}"
+os.makedirs(os.path.dirname(cfg_path), exist_ok=True)
+with open(cfg_path) if os.path.exists(cfg_path) else open(cfg_path, "w") as f:
+    cfg = yaml.safe_load(f) if os.path.getsize(cfg_path) > 0 else {}
+cfg.setdefault("model", {})
+cfg["model"]["default"] = "${model_id}"
+cfg["model"]["base_url"] = "${base_url}"
+cfg["model"]["api_key"] = "${api_key_env}"
+with open(cfg_path, "w") as f:
+    yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=False)
+PYEOF
+    echo "✓ Hermes main (API): ${model_id} @ ${base_url} (key=\${${api_key_env}})"
+}
+
+wire_hermes_api_aux() {
+    local model_id="$1"
+    local base_url="$2"
+    local api_key_env="$3"
+    local tasks=(vision web_extract compression session_search skills_hub approval mcp title_generation curator)
+    python3 - <<PYEOF
+import yaml, os
+cfg_path = "${HERMES_CONFIG}"
+with open(cfg_path) if os.path.exists(cfg_path) else open(cfg_path, "w") as f:
+    cfg = yaml.safe_load(f) if os.path.getsize(cfg_path) > 0 else {}
+cfg.setdefault("auxiliary", {})
+tasks = ${tasks[@]@Q}
+for task in tasks:
+    cfg["auxiliary"].setdefault(task, {})
+    cfg["auxiliary"][task]["provider"] = "custom:api"
+    cfg["auxiliary"][task]["base_url"] = "${base_url}"
+    cfg["auxiliary"][task]["api_key"] = "${api_key_env}"
+    cfg["auxiliary"][task]["model"] = "${model_id}"
+with open(cfg_path, "w") as f:
+    yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=False)
+PYEOF
+    echo "✓ Hermes aux (API): ${model_id} @ ${base_url} (key=\${${api_key_env}})"
+}
+
+# Provider base URLs + key env vars
+declare -A API_BASE_URL=(
+    [openrouter]="https://openrouter.ai/api/v1"
+    [nvidia-nim]="https://integrate.api.nvidia.com/v1"
+    [anthropic]="https://api.anthropic.com/v1"
+    [openai]="https://api.openai.com/v1"
+)
+declare -A API_KEY_ENV=(
+    [openrouter]="OPENROUTER_API_KEY"
+    [nvidia-nim]="NVIDIA_API_KEY"
+    [anthropic]="ANTHROPIC_API_KEY"
+    [openai]="OPENAI_API_KEY"
+)
+
+serve_auto() {
+    local role="main"
+    local want_vision="false"
+    local prefer_free="false"
+    local force_api="false"
+
+    # Parse: serve_auto [main|aux] [--vision] [--free] [--api] [--ui ...]
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            main|aux) role="$1"; shift ;;
+            --vision) want_vision="true"; shift ;;
+            --free)   prefer_free="true"; shift ;;
+            --api)    force_api="true"; shift ;;
+            *) shift ;;
+        esac
+    done
+
+    # If --api flag or no NVIDIA GPU detected, skip local and go straight to API
+    if [ "${force_api}" = "true" ]; then
+        echo "→ API mode forced. Skipping local catalog."
+    elif ! command -v nvidia-smi >/dev/null 2>&1; then
+        echo "→ No NVIDIA GPU detected. Defaulting to API mode."
+        force_api="true"
+    else
+        # Check VRAM — if <8GB free, suggest API
+        local vram_json
+        vram_json=$(probe_vram 2>/dev/null || echo '{"free_GB":0}')
+        local free_gb
+        free_gb=$(echo "${vram_json}" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('free_GB',0))" 2>/dev/null || echo "0")
+        local total_gb
+        total_gb=$(echo "${vram_json}" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(round(d.get('total_MiB',0)/1024,1))" 2>/dev/null || echo "0")
+
+        if awk "BEGIN{exit !(${total_gb} < 8)}"; then
+            echo "→ GPU VRAM too small (${total_gb}GB total). Defaulting to API mode."
+            echo "  Recommended: API main (DeepSeek V4 Pro, free on NIM) + API aux (Kimi K2.6, free)"
+            force_api="true"
+        elif awk "BEGIN{exit !(${total_gb} < 16)}"; then
+            echo "→ Modest GPU (${total_gb}GB). Can run local aux with cpu-moe, or API main + local aux."
+            echo "  Recommended: API main (DeepSeek V4 Pro) + local aux (Carnice with cpu-moe)"
+            echo "  Alternative: Small local main (Prism Eagle 14GB) + API aux"
+        elif [ "${free_gb}" != "?" ] && awk "BEGIN{exit !(${free_gb} < 8)}"; then
+            echo "→ Tight VRAM (${free_gb}GB free of ${total_gb}GB). Consider API aux to free space."
+        fi
+    fi
+
+    # If API mode, pick from curated API slots directly
+    if [ "${force_api}" = "true" ]; then
+        local pick_json
+        pick_json=$(pick_api_model "${role}" "${want_vision}" "${prefer_free}")
+        local pick_provider pick_model_id pick_alias pick_base_url pick_key_env
+        pick_provider=$(echo "${pick_json}" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('provider',''))" 2>/dev/null || echo "")
+        pick_model_id=$(echo "${pick_json}"  | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('model_id',''))" 2>/dev/null || echo "")
+        pick_alias=$(echo "${pick_json}"     | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('alias',''))" 2>/dev/null || echo "")
+        local pick_reason
+        pick_reason=$(echo "${pick_json}"    | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('reason',''))" 2>/dev/null || echo "")
+
+        pick_base_url="${API_BASE_URL[${pick_provider:-unknown}]:-https://openrouter.ai/api/v1}"
+        pick_key_env="${API_KEY_ENV[${pick_provider:-unknown}]:-OPENROUTER_API_KEY}"
+
+        echo "→ Auto-pick for ${role} (API): ${pick_alias}"
+        echo "  Provider: ${pick_provider}  Model: ${pick_model_id}"
+        echo "  ${pick_reason}"
+        echo ""
+
+        if [ "${role}" = "main" ]; then
+            wire_hermes_api_main "${pick_model_id}" "${pick_base_url}" "${pick_key_env}"
+        else
+            wire_hermes_api_aux "${pick_model_id}" "${pick_base_url}" "${pick_key_env}"
+        fi
+        return 0
+    fi
+
+    # Local path — use curated.yaml
+    local pick_json
+    pick_json=$(pick_from_curated "${role}" "${want_vision}" "${prefer_free}")
+    local pick_type
+    pick_type=$(echo "${pick_json}" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('type',''))" 2>/dev/null || echo "")
+
+    if [ -z "${pick_type}" ]; then
+        echo "✗ No curated pick found for role=${role} vision=${want_vision} free=${prefer_free}"
+        echo "  Check: ~/.config/turbofit/curated.yaml"
+        return 1
+    fi
+
+    if [ "${pick_type}" = "local" ]; then
+        local pick_alias
+        pick_alias=$(echo "${pick_json}" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('alias',''))" 2>/dev/null || echo "")
+        local pick_reason
+        pick_reason=$(echo "${pick_json}" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('reason',''))" 2>/dev/null || echo "")
+        echo "→ Auto-pick for ${role} (LOCAL): ${pick_alias}"
+        echo "  ${pick_reason}"
+        echo ""
+
+        if [ "${role}" = "main" ]; then
+            serve_main "${pick_alias}"
+        else
+            serve_aux "${pick_alias}"
+        fi
+    else
+        # API path
+        local pick_provider pick_model_id pick_alias
+        pick_provider=$(echo "${pick_json}" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('provider',''))" 2>/dev/null || echo "")
+        pick_model_id=$(echo "${pick_json}"  | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('model_id',''))"  2>/dev/null || echo "")
+        pick_alias=$(echo "${pick_json}"     | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('alias',''))"   2>/dev/null || echo "")
+        local pick_reason
+        pick_reason=$(echo "${pick_json}"    | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('reason',''))"   2>/dev/null || echo "")
+
+        local base_url="${API_BASE_URL[${pick_provider:-unknown}]:-https://openrouter.ai/api/v1}"
+        local key_env="${API_KEY_ENV[${pick_provider:-unknown}]:-OPENROUTER_API_KEY}"
+
+        echo "→ Auto-pick for ${role} (API): ${pick_alias}"
+        echo "  Provider: ${pick_provider}  Model: ${pick_model_id}"
+        echo "  ${pick_reason}"
+        echo ""
+
+        if [ "${role}" = "main" ]; then
+            wire_hermes_api_main "${pick_model_id}" "${base_url}" "${key_env}"
+        else
+            wire_hermes_api_aux "${pick_model_id}" "${base_url}" "${key_env}"
+        fi
+    fi
+}
+
+serve_downscale() {
+    # Probes current VRAM and either:
+    #   - warns that everything is fine (no change)
+    #   - shrinks ctx on the running main alias
+    #   - stops aux to free VRAM
+    #   - swaps to a smaller-tier main
+    #   - offloads experts (MoE)
+    local current_main
+    current_main=$(python3 -c "
+import yaml
+with open('${HERMES_CONFIG}') as f: cfg = yaml.safe_load(f) or {}
+print(cfg.get('model', {}).get('default', '') or '')
+" 2>/dev/null || echo "")
+
+    if [ -z "${current_main}" ]; then
+        echo "✗ No main model set in ${HERMES_CONFIG}"
+        return 1
+    fi
+
+    local vram_json
+    vram_json=$(probe_vram)
+    local free_gb
+    free_gb=$(echo "${vram_json}" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('free_GB','?'))" 2>/dev/null || echo "?")
+
+    echo "Current main: ${current_main}"
+    echo "Free VRAM:    ${free_gb} GB"
+    echo ""
+
+    # Find running aux daemons by scanning platform daemons + catalog role
+    local aux_aliases=()
+    while IFS= read -r alias; do
+        [ -z "${alias}" ] && continue
+        # Skip the main model
+        [ "${alias}" = "${current_main}" ] && continue
+        # Check if this alias has role: aux in the catalog
+        local role
+        role=$(python3 -c "
+import yaml
+with open('${CATALOG}') as f: cfg = yaml.safe_load(f) or {}
+print(cfg.get('models', {}).get('${alias}', {}).get('role', ''))
+" 2>/dev/null || echo "")
+        if [ "${role}" = "aux" ]; then
+            aux_aliases+=("${alias}")
+        fi
+    done < <(tf_daemon_list_aliases 2>/dev/null)
+
+    # Also check PID-file managed aux servers
+    if [ -d "${TURBOFIT_ROOT}/pid" ]; then
+        for pid_file in "${TURBOFIT_ROOT}/pid"/*; do
+            [ -f "${pid_file}" ] || continue
+            local a; a=$(basename "${pid_file}")
+            [ "${a}" = "${current_main}" ] && continue
+            # Check if already in list
+            local skip=0
+            for existing in "${aux_aliases[@]:-}"; do
+                [ "${existing}" = "${a}" ] && skip=1 && break
+            done
+            [ "$skip" -eq 0 ] && aux_aliases+=("${a}")
+        done
+    fi
+
+    # Heuristic ladder (simplified — full ladder in serve auto):
+    if [ "${free_gb}" != "?" ] && awk "BEGIN{exit !(${free_gb} < 4)}"; then
+        echo "⚠ Critical VRAM (<4GB). Consider API-only mode."
+        echo "  Run: serve auto main --api --free && serve auto aux --free"
+        echo "  Free option: DeepSeek V4 Pro (NIM) + Kimi K2.6 — zero cost, strong performance."
+        return 0
+    fi
+    if [ "${free_gb}" != "?" ] && awk "BEGIN{exit !(${free_gb} < 8)}"; then
+        echo "⚠ Tight VRAM (<8GB). Stop aux, shrink main ctx to 64K."
+        # stop all aux models
+        for a in "${aux_aliases[@]:-}"; do
+            [ -n "${a}" ] && stop_server "${a}"
+        done
+        # rewrite catalog ctx to 65536 and restart main
+        python3 - "${current_main}" <<'PYEOF'
+import sys, yaml, os
+alias = sys.argv[1]
+p = os.environ.get("TURBOFIT_CATALOG", os.path.expanduser("~/.config/turbofit/models.yaml"))
+with open(p) as f: cfg = yaml.safe_load(f) or {}
+if alias in cfg.get("models", {}):
+    cfg["models"][alias]["ctx"] = 65536
+    with open(p, "w") as f: yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=False)
+PYEOF
+        stop_server "${current_main}"
+        launch_server "${current_main}"
+        return $?
+    fi
+    if [ "${free_gb}" != "?" ] && awk "BEGIN{exit !(${free_gb} < 14)}"; then
+        echo "⚠ Marginal VRAM (<14GB). Stop aux."
+        for a in "${aux_aliases[@]:-}"; do
+            [ -n "${a}" ] && stop_server "${a}"
+        done
+        return 0
+    fi
+    echo "✓ VRAM healthy — no downscale needed."
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Hermes-Agent config
+# ─────────────────────────────────────────────────────────────────────────────
+
+set_hermes_main() {
+    local model_name="$1"
+    local base_url="$2"
+    python3 - <<PYEOF
+import yaml, os
+cfg_path = "${HERMES_CONFIG}"
+os.makedirs(os.path.dirname(cfg_path), exist_ok=True)
+with open(cfg_path) if os.path.exists(cfg_path) else open(cfg_path, "w") as f:
+    cfg = yaml.safe_load(f) if os.path.getsize(cfg_path) > 0 else {}
+cfg.setdefault("model", {})
+cfg["model"]["default"] = "${model_name}"
+cfg["model"]["base_url"] = "${base_url}"
+cfg["model"]["api_key"] = "not-needed"
+with open(cfg_path, "w") as f:
+    yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=False)
+PYEOF
+    echo "✓ Hermes main: ${model_name} @ ${base_url}"
+}
+
+set_hermes_aux() {
+    local model_name="$1"
+    local base_url="$2"
+    local tasks=(vision web_extract compression session_search skills_hub approval mcp title_generation curator)
+    python3 - <<PYEOF
+import yaml, os
+cfg_path = "${HERMES_CONFIG}"
+with open(cfg_path) if os.path.exists(cfg_path) else open(cfg_path, "w") as f:
+    cfg = yaml.safe_load(f) if os.path.getsize(cfg_path) > 0 else {}
+cfg.setdefault("auxiliary", {})
+tasks = ${tasks[@]@Q}
+for task in tasks:
+    cfg["auxiliary"].setdefault(task, {})
+    cfg["auxiliary"][task]["provider"] = "custom:local"
+    cfg["auxiliary"][task]["base_url"] = "${base_url}"
+    cfg["auxiliary"][task]["api_key"] = "not-needed"
+    cfg["auxiliary"][task]["model"] = "${model_name}"
+with open(cfg_path, "w") as f:
+    yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=False)
+PYEOF
+    echo "✓ Hermes aux: ${model_name} @ ${base_url} (${#tasks[@]} tasks)"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NVIDIA NIM API helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+nvidia_nim_list() {
+    [ -f "${NVIDIA_NIM_FILE}" ] || write_nvidia_nim_list
+    python3 - <<'PYEOF'
+import yaml, os
+with open(os.environ.get("TURBOFIT_NIM_FILE", os.path.expanduser("~/.local/share/turbofit/nvidia-nim-curated.yaml"))) as f:
+    cfg = yaml.safe_load(f)
+print(f"Provider: {cfg['provider']}  base_url: {cfg['base_url']}")
+print(f"All 5 models have FREE endpoints on build.nvidia.com (NVIDIA_API_KEY, ~1000 RPM at signup)")
+print("")
+print(f"{'Rank':<5} {'Model':<22} {'Vision':<7} {'$/in':<8} {'$/out':<8} API ID")
+print("-" * 100)
+for m in cfg['models']:
+    vis = "👁 yes" if m['has_vision'] else "  no"
+    pi = "FREE" if m.get('is_free') else f"${m['price_input']:.2f}"
+    po = "FREE" if m.get('is_free') else f"${m['price_output']:.2f}"
+    print(f"{m['rank']:<5} {m['name']:<22} {vis:<7} {pi:<8} {po:<8} {m['api_id']}")
+PYEOF
+}
+
+nvidia_nim_use() {
+    local rank_or_id="$1"
+    local role="${2:-main}"
+    [ -f "${NVIDIA_NIM_FILE}" ] || write_nvidia_nim_list
+    python3 - "${rank_or_id}" "${role}" "${HERMES_CONFIG}" <<'PYEOF'
+import sys, os, yaml
+target, role, cfg_path = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(os.environ.get("TURBOFIT_NIM_FILE", os.path.expanduser("~/.local/share/turbofit/nvidia-nim-curated.yaml"))) as f:
+    cfg = yaml.safe_load(f)
+m = next((x for x in cfg['models'] if x['rank'] == int(target) or x['api_id'] == target), None)
+if not m:
+    print(f"Unknown rank/id: {target}"); sys.exit(1)
+os.makedirs(os.path.dirname(cfg_path), exist_ok=True)
+with open(cfg_path) if os.path.exists(cfg_path) else open(cfg_path, "w") as f:
+    cfg2 = yaml.safe_load(f) if os.path.getsize(cfg_path) > 0 else {}
+cfg2.setdefault("model", {})
+cfg2["model"]["default"] = m['api_id']
+cfg2["model"]["base_url"] = "https://integrate.api.nvidia.com/v1"
+cfg2["model"]["api_key"] = "${NVIDIA_API_KEY}"
+cfg2["model"]["context_length"] = cfg.get("context_length", 1000000)
+if role == "aux":
+    cfg2.setdefault("auxiliary", {})
+    for task in ("vision","web_extract","compression","session_search","skills_hub","approval","mcp","title_generation","curator"):
+        cfg2["auxiliary"].setdefault(task, {})
+        cfg2["auxiliary"][task]["provider"] = "openai"
+        cfg2["auxiliary"][task]["base_url"] = "https://integrate.api.nvidia.com/v1"
+        cfg2["auxiliary"][task]["api_key"] = "${NVIDIA_API_KEY}"
+        cfg2["auxiliary"][task]["model"] = m['api_id']
+with open(cfg_path, "w") as f:
+    yaml.safe_dump(cfg2, f, default_flow_style=False, sort_keys=False)
+print(f"✓ Hermes {role}: {m['name']} ({m['api_id']})")
+PYEOF
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Catalog — extended schema
+# ─────────────────────────────────────────────────────────────────────────────
+
+next_port() {
+    local used=()
+    [ -f "${CATALOG}" ] && used+=($(grep -oE "port: [0-9]+" "${CATALOG}" 2>/dev/null | grep -oE "[0-9]+" || true))
+    local port=8080
+    while printf "%s\n" "${used[@]}" | grep -qx "${port}" 2>/dev/null; do
+        port=$((port + 1))
+    done
+    echo "${port}"
+}
+
+register_alias() {
+    local alias="$1"; local path="$2"
+    local launcher="llama-cpp"; local port=""
+    shift 2
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --launcher) launcher="$2"; shift 2 ;;
+            --port)     port="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    if [ -z "${alias}" ] || [ -z "${path}" ]; then
+        echo "Usage: name <alias> <path-or-hf-repo> [--launcher llama-cpp|ollama|vllm|sglang] [--port N]"
+        return 1
+    fi
+    [ -z "${port:-}" ] && port=$(next_port)
+    python3 - <<PYEOF
+import yaml, os
+cfg_path = "${CATALOG}"
+os.makedirs(os.path.dirname(cfg_path), exist_ok=True)
+with open(cfg_path) if os.path.exists(cfg_path) else open(cfg_path, "w") as f:
+    cfg = yaml.safe_load(f) if os.path.getsize(cfg_path) > 0 else {}
+cfg.setdefault("models", {})
+cfg["models"]["${alias}"] = {
+    "launcher": "${launcher}",
+    "path": "${path}",
+    "port": ${port},
+    "ctx": 65536,
+}
+with open(cfg_path, "w") as f:
+    yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=False)
+PYEOF
+    echo "✓ Registered '${alias}' → ${path} (launcher=${launcher}) on :${port}"
+}
+
+list_catalog() {
+    if [ ! -f "${CATALOG}" ]; then
+        echo "Catalog empty. Use 'name <alias> <path>' to register a model."
+        return
+    fi
+    python3 - <<'PYEOF'
+import yaml, os
+catalog = os.environ.get("TURBOFIT_CATALOG", os.path.expanduser("~/.config/turbofit/models.yaml"))
+with open(catalog) as f:
+    cfg = yaml.safe_load(f) or {}
+models = cfg.get("models", {})
+if not models:
+    print("Catalog empty.")
+else:
+    print(f"{'Alias':<30} {'Tier':<5} {'Feat':<5} {'GPU':<4} {'Port':<6} {'Ctx':<7} {'Tok/s':<6} {'Launcher':<11} Description")
+    print("-" * 140)
+    # Sort: featured first, then by tier rank, then by name
+    tier_rank = {"s":0,"sf":1,"sd":2,"f":3,"c":4}
+    def sort_key(item):
+        a, m = item
+        return (0 if m.get("featured") else 1,
+                tier_rank.get(m.get("tier","c"), 9),
+                a)
+    for alias, info in sorted(models.items(), key=sort_key):
+        feat = "⭐" if info.get("featured") else "  "
+        gpu = str(info.get("gpu","-"))
+        tok = info.get("tok_s_target", "")
+        desc = (info.get("description","") or "").replace("\n"," ")[:60]
+        print(f"{alias:<30} {(info.get('tier','-')):<5} {feat:<5} {gpu:<4} {info.get('port','?'):<6} {info.get('ctx','?'):<7} {tok!s:<6} {(info.get('launcher','llama-cpp')):<11} {desc}")
+PYEOF
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# High-level: launch + set as main/aux + start UI
+# ─────────────────────────────────────────────────────────────────────────────
+
+start_ui() {
+    local ui="${1:-tui}"
+    case "${ui}" in
+        tui)       exec hermes --tui ;;
+        dashboard) exec hermes dashboard ;;
+        desktop)   exec hermes desktop ;;
+        gateway)   exec hermes gateway run ;;
+        herm|herm_main|herm_aux)
+            exec herm
+            ;;
+        *)
+            echo "Unknown UI: ${ui}"
+            echo "  Supported: tui, dashboard, desktop, gateway, herm"
+            return 1
+            ;;
+    esac
+}
+
+serve_main() {
+    local alias="$1"
+    local ui="${UI:-tui}"
+    # Check if a platform daemon is already running for this alias
+    if tf_daemon_is_active "${alias}" 2>/dev/null; then
+        local port
+        port=$(tf_daemon_port "${alias}" 2>/dev/null || echo "?")
+        echo "✓ ${alias} already running as daemon on :${port}"
+        set_hermes_main "${alias}" "http://127.0.0.1:${port}/v1"
+        start_ui "${ui}"
+        return 0
+    fi
+    # Check if a PID-file managed server is already running
+    if [ -f "${TURBOFIT_ROOT}/pid/${alias}" ] && kill -0 "$(cat "${TURBOFIT_ROOT}/pid/${alias}")" 2>/dev/null; then
+        local port
+        port=$(cat "${TURBOFIT_ROOT}/port/${alias}" 2>/dev/null || echo 8080)
+        echo "✓ ${alias} already running (pid $(cat "${TURBOFIT_ROOT}/pid/${alias}")) on :${port}"
+        set_hermes_main "${alias}" "http://127.0.0.1:${port}/v1"
+        start_ui "${ui}"
+        return 0
+    fi
+    launch_server "${alias}" || return 1
+    local port
+    port=$(cat "${TURBOFIT_ROOT}/port/${alias}" 2>/dev/null || echo 8080)
+    set_hermes_main "${alias}" "http://127.0.0.1:${port}/v1"
+    start_ui "${ui}"
+}
+
+serve_aux() {
+    local alias="$1"
+    local ui="${UI:-tui}"
+    # Check if a platform daemon is already running for this alias
+    if tf_daemon_is_active "${alias}" 2>/dev/null; then
+        local port
+        port=$(tf_daemon_port "${alias}" 2>/dev/null || echo "?")
+        echo "✓ ${alias} already running as daemon on :${port}"
+        set_hermes_aux "${alias}" "http://127.0.0.1:${port}/v1"
+        start_ui "${ui}"
+        return 0
+    fi
+    # Check if a PID-file managed server is already running
+    if [ -f "${TURBOFIT_ROOT}/pid/${alias}" ] && kill -0 "$(cat "${TURBOFIT_ROOT}/pid/${alias}")" 2>/dev/null; then
+        local port
+        port=$(cat "${TURBOFIT_ROOT}/port/${alias}" 2>/dev/null || echo 8080)
+        echo "✓ ${alias} already running (pid $(cat "${TURBOFIT_ROOT}/pid/${alias}")) on :${port}"
+        set_hermes_aux "${alias}" "http://127.0.0.1:${port}/v1"
+        start_ui "${ui}"
+        return 0
+    fi
+    launch_server "${alias}" || return 1
+    local port
+    port=$(cat "${TURBOFIT_ROOT}/port/${alias}" 2>/dev/null || echo 8080)
+    set_hermes_aux "${alias}" "http://127.0.0.1:${port}/v1"
+    start_ui "${ui}"
+}
+
+serve_herm() {
+    local first="${1:-}"
+    if [ "${first}" = "aux" ]; then
+        shift
+        local aux_alias="${1:-}"
+        if [ -z "${aux_alias}" ]; then
+            # No alias given — auto-pick aux, but use herm UI
+            local pick_json
+            pick_json=$(pick_from_curated "aux" "false" "false" 2>/dev/null)
+            aux_alias=$(echo "${pick_json}" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('alias',''))" 2>/dev/null || echo "")
+            if [ -z "${aux_alias}" ]; then
+                echo "✗ No aux model found. Usage: serve herm [aux] [alias]"
+                return 1
+            fi
+            echo "→ Auto-pick for aux: ${aux_alias}"
+        fi
+        UI="herm_aux" serve_aux "${aux_alias}"
+    elif [ -n "${first}" ]; then
+        UI="herm_main" serve_main "${first}"
+    else
+        # No args — auto-pick main and launch herm TUI
+        local pick_json
+        pick_json=$(pick_from_curated "main" "false" "false" 2>/dev/null)
+        local main_alias
+        main_alias=$(echo "${pick_json}" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('alias',''))" 2>/dev/null || echo "")
+        if [ -z "${main_alias}" ]; then
+            echo "✗ No main model found. Usage: serve herm [alias]"
+            return 1
+        fi
+        echo "→ Auto-pick for main: ${main_alias}"
+        UI="herm_main" serve_main "${main_alias}"
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Daemon management — systemd user services with wake-on-ping proxy
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Consolidates omni-va.service, llama-proxy-main.service, llama-darwin.service,
+# model-rotation.service into turbofit-managed daemon services.
+#
+# Each daemon is a systemd user service named turbofit-<alias>.service that:
+#   - Uses llama-proxy (wake-on-ping) to auto-spawn the backend on first request
+#   - Idle-kills the backend after IDLE_KILL_SECS (default 1800 = 30 min)
+#   - Auto-heals on crash (Restart=on-failure + clean-exit-0 pattern)
+#   - Starts at boot (enabled in default.target.wants)
+#   - Reads all flags from the catalog entry automatically
+#
+# Usage:
+#   serve daemon install <alias>     Generate + enable systemd service for catalog model
+#   serve daemon remove <alias>     Stop + disable + remove systemd service
+#   serve daemon start <alias>      Start the daemon (proxy only — backend wakes on ping)
+#   serve daemon stop <alias>       Stop the daemon (also kills backend, frees VRAM)
+#   serve daemon restart <alias>    Stop + start
+#   serve daemon status [alias]     Show status of one or all turbofit daemons
+#   serve daemon list               List all turbofit-managed daemon services
+#   serve daemon migrate <legacy>   Migrate a legacy service to turbofit daemon
+
+# DAEMON_UNIT_DIR and LLAMA_PROXY_BIN are now set by the OS detection block
+# at the top of the script (platform-aware).
+
+
+# Resolve the full extra args string for a daemon from the catalog entry
+# This produces the value for LLAMA_SERVER_EXTRA_ARGS
+daemon_extra_args() {
+    local alias="$1"
+    python3 - "$alias" <<'PYEOF'
+import sys, os, yaml, json
+
+alias = sys.argv[1]
+catalog = os.environ.get("TURBOFIT_CATALOG", os.path.expanduser("~/.config/turbofit/models.yaml"))
+if not os.path.exists(catalog):
+    sys.exit(1)
+
+with open(catalog) as f:
+    cfg = yaml.safe_load(f) or {}
+models = cfg.get("models", {})
+
+# Resolve alias
+m = models.get(alias)
+if not m:
+    for canonical, info in models.items():
+        if alias in (info.get("aliases") or []):
+            m = info; alias = canonical; break
+if not m:
+    sys.exit(1)
+
+# Build extra args
+args = []
+
+# 1) Presets
+preset_map = {
+    "nextn": ["--spec-type", "nextn", "--draft-block-size", "3"],
+    "nextn-tight": ["--spec-type", "nextn", "--draft-block-size", "2"],
+    "draft-mtp": ["--spec-type", "draft-mtp"],
+    "draft-mtp-tight": ["--spec-type", "draft-mtp", "--draft-block-size", "2"],
+    "turbo4-kv": ["-ctk", "turbo4", "-ctv", "turbo4"],
+    "turbo3-kv": ["-ctk", "turbo3", "-ctv", "turbo3"],
+    "turbo2-kv": ["-ctk", "turbo2", "-ctv", "turbo2"],
+    "q8-kv": ["-ctk", "q8_0", "-ctv", "q8_0"],
+    "q4-kv": ["-ctk", "q4_0", "-ctv", "q4_0"],
+    "no-mmap": ["--no-mmap"],
+    "split-none": ["--split-mode", "none"],
+    "mlock": ["--mlock"],
+    "parallel-4": ["--parallel", "4"],
+    "parallel-2": ["--parallel", "2"],
+    "parallel-1": ["--parallel", "1"],
+    "cpu-moe-2": ["--n-cpu-moe", "2"],
+    "cpu-moe-4": ["--n-cpu-moe", "4"],
+    "cpu-moe-8": ["--n-cpu-moe", "8"],
+}
+
+for p in (m.get("presets") or []):
+    if p in preset_map:
+        args.extend(preset_map[p])
+
+# 2) Extra args
+for a in (m.get("extra_args") or []):
+    args.append(str(a))
+
+# 3) GPU selection → --main-gpu
+gpu = m.get("gpu")
+if gpu is not None:
+    args.extend(["--main-gpu", str(gpu)])
+
+# 4) mmproj
+if m.get("mmproj"):
+    args.extend(["--mmproj", m["mmproj"]])
+
+# 5) Context (enforce 64K floor)
+ctx = m.get("ctx", 65536)
+if ctx < 65536:
+    ctx = 65536
+args.extend(["-c", str(ctx)])
+
+# 6) Flash attention
+args.extend(["--flash-attn", "on"])
+
+# 7) model-draft for spec decoding (if nextn/draft-mtp preset, use same GGUF)
+presets = m.get("presets") or []
+has_spec = any(p in presets for p in ["nextn", "nextn-tight", "draft-mtp", "draft-mtp-tight"])
+if has_spec:
+    model_path = m.get("path", "")
+    args.extend(["--model-draft", model_path])
+    # Note: --cpu-moe-draft and --mmproj-draft are not supported in the current
+    # atomic fork. The draft model shares the same GGUF so cpu-moe applies
+    # automatically if set on the main model.
+
+# 9) Parallel override
+if m.get("parallel"):
+    args.extend(["--parallel", str(m["parallel"])])
+
+# Print as single string (space-joined)
+print(" ".join(args))
+PYEOF
+}
+
+# Generate a daemon for a catalog alias (systemd unit on Linux, launch script on Windows)
+daemon_install() {
+    local alias="$1"
+    shift || true
+
+    # Parse optional flags
+    local idle_secs="${DAEMON_IDLE_SECS:-1800}"
+    local startup_timeout="${DAEMON_STARTUP_TIMEOUT:-900}"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --idle)      idle_secs="$2"; shift 2 ;;
+            --timeout)   startup_timeout="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+
+    # Resolve alias from catalog
+    local info
+    info=$(alias_info "${alias}" 2>/dev/null)
+    [ -z "${info}" ] && { echo "✗ Unknown alias: ${alias}"; return 1; }
+
+    local launcher path port ctx
+    launcher=$(echo "${info}" | awk '{print $1}')
+    path=$(echo "${info}"     | awk '{print $2}')
+    port=$(echo "${info}"     | awk '{print $3}')
+    ctx=$(echo "${info}"      | awk '{print $4}')
+
+    # Only llama-cpp supports wake-on-ping proxy
+    if [ "${launcher}" != "llama-cpp" ]; then
+        echo "✗ Daemon mode only supports llama-cpp launcher (got: ${launcher})"
+        return 1
+    fi
+
+    # Get full model info
+    local catalog_json
+    catalog_json=$(alias_full "${alias}" 2>/dev/null || true)
+    local binary=""
+    local gpu=0
+    local description=""
+    if [ -n "${catalog_json}" ]; then
+        binary=$(echo "${catalog_json}" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('binary','') or '')" 2>/dev/null || echo "")
+        gpu=$(echo "${catalog_json}" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('gpu',0))" 2>/dev/null || echo "0")
+        description=$(echo "${catalog_json}" | python3 -c "import sys,json; print((json.loads(sys.stdin.read()).get('description','') or '').replace(chr(10),' ')[:120])" 2>/dev/null || echo "")
+    fi
+    [ -z "${binary}" ] && binary="llama-server"
+
+    # Resolve binary (append .exe on Windows if needed)
+    binary=$(tf_resolve_binary "${binary}")
+
+    # Resolve extra args from catalog
+    local extra_args
+    extra_args=$(daemon_extra_args "${alias}" 2>/dev/null || echo "")
+
+    # Calculate proxy and backend ports
+    local proxy_port="${port}"
+    local backend_port=$((port + 1000))
+
+    mkdir -p "${DAEMON_UNIT_DIR}"
+
+    if [ "${TURBOFIT_OS}" = "windows" ]; then
+        # ── Windows: generate a launch script (PID-based daemon management) ──
+        # No systemd / wake-on-ping proxy on Windows. The launch script runs
+        # llama-server directly in the background. tf_daemon_start runs this
+        # script and tracks the PID.
+        local launcher_script="${DAEMON_UNIT_DIR}/turbofit-${alias}.launch.sh"
+        local log_file="${TURBOFIT_ROOT}/logs/daemon-${alias}.log"
+
+        # Build library path env vars (Windows uses PATH, not LD_LIBRARY_PATH)
+        local env_lines=""
+        if [ -n "${binary}" ] && [ "${binary}" != "llama-server" ] && [ "${binary}" != "llama-server.exe" ]; then
+            local lib_dir
+            lib_dir=$(dirname "${binary}" 2>/dev/null || echo "")
+            if [ -n "${lib_dir}" ]; then
+                env_lines="export PATH=\"${lib_dir}:\${PATH}\""
+            fi
+        fi
+
+        cat > "${launcher_script}" <<EOF
+#!/usr/bin/env bash
+# turbofit daemon launch script — ${alias}${description:+ (${description})}
+# Generated by: serve daemon install ${alias}
+# Platform: Windows (PID-based daemon management)
+#
+# This script is executed by tf_daemon_start() in the background.
+# The PID is tracked in ${DAEMON_UNIT_DIR}/turbofit-${alias}.pid
+
+${env_lines}
+
+# Launch llama-server directly (no wake-on-ping proxy on Windows)
+exec "${binary}" \\
+    -m "${path}" \\
+    --host 127.0.0.1 --port ${proxy_port} \\
+    -ngl 99 -fa on \\
+    -c ${ctx} \\
+    --jinja \\
+    -t \$(nproc 2>/dev/null || echo 4) \\
+    ${extra_args}
+EOF
+        chmod +x "${launcher_script}" 2>/dev/null || true
+
+        echo "✓ Daemon installed: ${alias}"
+        echo ""
+        echo "  Script:   ${launcher_script}"
+        echo "  Port:     :${proxy_port}"
+        echo "  Model:    ${path}"
+        echo "  Binary:   ${binary}"
+        echo "  Extra:    ${extra_args}"
+        echo "  Logs:     ${log_file}"
+        echo ""
+        echo "  Commands:"
+        echo "    serve daemon start ${alias}"
+        echo "    serve daemon status ${alias}"
+        echo "    serve daemon stop ${alias}"
+        echo "    serve daemon remove ${alias}"
+        echo ""
+        echo "  Note: Windows daemons use PID files (no systemd). No wake-on-ping"
+        echo "  proxy or auto-restart on crash. Use 'serve daemon restart' to recover."
+    else
+        # ── Linux: generate a systemd user service unit ──
+        local unit_name="turbofit-${alias}.service"
+        local unit_path="${DAEMON_UNIT_DIR}/${unit_name}"
+
+        # Build LD_LIBRARY_PATH + LLAMA_LIB_DIR lines only if using custom binary
+        local ld_line=""
+        local lib_line=""
+        if [ -n "${binary}" ] && [ "${binary}" != "llama-server" ]; then
+            local lib_dir
+            lib_dir=$(dirname "${binary}")
+            ld_line="Environment=\"LD_LIBRARY_PATH=${lib_dir}\""
+            lib_line="Environment=\"LLAMA_LIB_DIR=${lib_dir}\""
+        fi
+
+        cat > "${unit_path}" <<EOF
+[Unit]
+Description=turbofit daemon — ${alias}${description:+ (${description})}
+Documentation=https://github.com/SouthpawIN/turbofit
+After=network.target
+
+[Service]
+# turbofit-managed daemon — wake-on-ping proxy + auto-heal
+# Proxy listens on :${proxy_port}, spawns backend on :${backend_port} (GPU ${gpu}) on first request
+# Idle-kills backend after ${idle_secs}s of no traffic (frees VRAM)
+# Auto-heals on crash (Restart=on-failure), clean stops stay down (exit 0)
+
+# Binary + library paths
+Environment="LLAMA_SERVER=${binary}"
+${ld_line}
+${lib_line}
+
+# Extra args resolved from catalog entry
+Environment="LLAMA_SERVER_EXTRA_ARGS=${extra_args}"
+
+# Idle timeout (seconds of no traffic before backend is killed)
+Environment="IDLE_KILL_SECS=${idle_secs}"
+
+# Startup timeout (max seconds to wait for backend to become healthy)
+Environment="STARTUP_TIMEOUT=${startup_timeout}"
+
+# ExecStart: proxy <listen_port> <backend_port> <gpu_id> <model_path>
+ExecStart=${LLAMA_PROXY_BIN} ${proxy_port} ${backend_port} ${gpu} ${path}
+
+# Auto-heal policy: restart ONLY on actual failures (non-zero exit, signal, OOM)
+# NOT on clean stops. Combined with proxy SIGTERM/SIGINT handler (exit 0):
+#   crash (segfault, OOM)     -> systemd restarts
+#   systemctl stop             -> exits 0, no restart
+#   boot                       -> starts because [Install] enabled
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+KillMode=mixed
+
+StandardOutput=append:${TURBOFIT_ROOT}/logs/daemon-${alias}.log
+StandardError=append:${TURBOFIT_ROOT}/logs/daemon-${alias}.log
+
+[Install]
+WantedBy=default.target
+EOF
+
+        # Reload systemd
+        systemctl --user daemon-reload
+
+        # Enable + start
+        systemctl --user enable "${unit_name}"
+        systemctl --user start "${unit_name}"
+
+        echo "✓ Daemon installed: ${alias}"
+        echo ""
+        echo "  Service:  ${unit_name}"
+        echo "  Proxy:    :${proxy_port} (wake-on-ping)"
+        echo "  Backend:  :${backend_port} (GPU ${gpu})"
+        echo "  Model:    ${path}"
+        echo "  Binary:   ${binary}"
+        echo "  Extra:    ${extra_args}"
+        echo "  Idle:     ${idle_secs}s"
+        echo "  Logs:     ${TURBOFIT_ROOT}/logs/daemon-${alias}.log"
+        echo ""
+        echo "  Commands:"
+        echo "    serve daemon status ${alias}"
+        echo "    serve daemon stop ${alias}"
+        echo "    serve daemon remove ${alias}"
+    fi
+}
+
+# Remove a turbofit-managed daemon
+daemon_remove() {
+    tf_daemon_remove "$@"
+}
+
+# Start/stop/restart a daemon
+daemon_start() {
+    tf_daemon_start "$@"
+}
+
+daemon_stop() {
+    tf_daemon_stop "$@"
+}
+
+daemon_restart() {
+    tf_daemon_restart "$@"
+}
+
+# Show daemon status
+daemon_status() {
+    local alias="${1:-}"
+    if [ -n "${alias}" ]; then
+        tf_daemon_status "${alias}"
+    else
+        tf_daemon_list
+    fi
+}
+
+# List all turbofit daemons
+daemon_list() {
+    tf_daemon_list
+}
+
+# Migrate a legacy service to a turbofit daemon
+daemon_migrate() {
+    tf_daemon_migrate "$@"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Fetch model from HuggingFace (from llama-launch)
+# ─────────────────────────────────────────────────────────────────────────────
+
+fetch_model() {
+    local alias="$1"
+    local repo
+    repo=$(python3 - "$alias" "$CATALOG" <<'PYEOF'
+import sys, yaml
+alias, catalog = sys.argv[1], sys.argv[2]
+with open(catalog) as f:
+    cfg = yaml.safe_load(f) or {}
+m = cfg.get("models", {}).get(alias)
+if not m or not m.get("hf_repo"):
+    print("")
+    sys.exit(1)
+print(m["hf_repo"])
+PYEOF
+)
+    if [ -z "${repo}" ]; then
+        echo "No hf_repo field. Add 'hf_repo: org/repo' to catalog entry for ${alias}"
+        return 1
+    fi
+    echo "Downloading ${alias} from huggingface.co/${repo} (Q4_K_M only)..."
+    local dest_dir
+    dest_dir=$(dirname "$(alias_info "${alias}" 2>/dev/null | awk '{print $2}')")
+    mkdir -p "${dest_dir}"
+    hf download "${repo}" --include="*Q4_K_M*" --local-dir "${dest_dir}"
+    echo "Done."
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Benchmark local models with tok/s + lm-eval-harness
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Reads port from CATALOG (not a hardcoded 8080 fallback), supports
+# `serve bench <alias>`, `serve bench all`, `serve bench --local`,
+# `serve bench --api`. Aggregates to ~/.config/turbofit/benchmark-results/.
+#
+# Two-pass bench per model:
+#   1. tok/s: streams a known prompt, measures prompt_eval + generation speed
+#   2. quality: lm-eval-harness (mmlu, gsm8k) with --limit N for speed
+
+# Read port for an alias from the catalog (NOT a hardcoded 8080)
+_catalog_port() {
+    local alias="$1"
+    python3 - "$CATALOG" "$alias" <<'PYEOF' 2>/dev/null
+import sys, yaml
+catalog = sys.argv[1]
+alias = sys.argv[2]
+try:
+    with open(catalog) as f:
+        cfg = yaml.safe_load(f) or {}
+    m = cfg.get("models", {}).get(alias, {})
+    port = m.get("port", "")
+    print(port if port else "")
+except Exception:
+    pass
+PYEOF
+}
+
+bench_local_one() {
+    local alias="$1"
+    local tasks="${2:-mmlu,gsm8k}"
+    local limit="${3:-50}"
+
+    # Pull port from catalog (the previous hardcoded 8080 fallback was the
+    # bug that caused 5/5 morning bench runs to fail with "serve start failed")
+    local port
+    port=$(_catalog_port "${alias}")
+    if [ -z "${port}" ]; then
+        echo "  ❌ ${alias}: no port in catalog — run: serve register ${alias} <path> --port N"
+        return 1
+    fi
+
+    # Make sure the daemon is up. If not, try to launch it.
+    if ! curl -sf "http://127.0.0.1:${port}/v1/models" >/dev/null 2>&1; then
+        echo "  ▲ ${alias}: daemon not up on :${port}, launching..."
+        if ! launch_server "${alias}" 2>/dev/null; then
+            # launch_server may have failed; try a fresh serve <alias>
+            if ! serve "${alias}" --no-ui 2>/dev/null; then
+                echo "  ❌ ${alias}: failed to launch on :${port}"
+                return 1
+            fi
+        fi
+        # Wait for backend to be ready (up to 90s for big GGUFs)
+        local waited=0
+        while [ $waited -lt 90 ]; do
+            if curl -sf "http://127.0.0.1:${port}/v1/models" >/dev/null 2>&1; then
+                break
+            fi
+            sleep 2
+            waited=$((waited + 2))
+        done
+        if ! curl -sf "http://127.0.0.1:${port}/v1/models" >/dev/null 2>&1; then
+            echo "  ❌ ${alias}: daemon still not ready on :${port} after 90s"
+            return 1
+        fi
+    fi
+
+    local started_at
+    started_at=$(date -Iseconds)
+    local outdir="${TURBOFIT_ROOT}/benchmarks"
+    mkdir -p "${outdir}"
+
+    # Pass 1: tok/s — measure via a streaming completion
+    echo "  ▲ ${alias} (port ${port}): tok/s probe..."
+    local toks_file="${outdir}/${alias}.toks.json"
+    python3 - "$alias" "$port" > "${toks_file}" 2>/dev/null <<'PYEOF' || echo "  ⚠ tok/s probe failed (non-fatal)"
+import json, sys, time, urllib.request
+
+alias, port = sys.argv[1], sys.argv[2]
+url = f"http://127.0.0.1:{port}/v1/chat/completions"
+# 256-token generation request — long enough to measure stable gen speed
+payload = json.dumps({
+    "model": alias,
+    "messages": [{"role": "user", "content": "Write 200 words about distributed systems."}],
+    "max_tokens": 256,
+    "stream": False,
+}).encode()
+
+try:
+    t0 = time.time()
+    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=180) as resp:
+        body = json.loads(resp.read())
+    elapsed = time.time() - t0
+    usage = body.get("usage", {})
+    pt = usage.get("prompt_tokens", 0)
+    ct = usage.get("completion_tokens", 0)
+    prompt_tps = pt / max(elapsed * 0.3, 0.001)  # rough: prompt eval ~30% of total
+    gen_tps = ct / max(elapsed * 0.7, 0.001)      # rough: generation ~70% of total
+    print(json.dumps({
+        "alias": alias,
+        "port": int(port),
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "elapsed_s": round(elapsed, 3),
+        "prompt_tokens": pt,
+        "completion_tokens": ct,
+        "prompt_tok_s": round(prompt_tps, 2),
+        "gen_tok_s": round(gen_tps, 2),
+        "model_id": body.get("model", alias),
+    }))
+except Exception as e:
+    print(json.dumps({"alias": alias, "error": str(e)}))
+    sys.exit(0)
+PYEOF
+
+    # Pass 2: quality — lm-eval-harness on a small subset
+    echo "  ▲ ${alias}: lm-eval (${tasks}, limit ${limit})..."
+    local qout="${outdir}/${alias}.lm_eval.log"
+    if command -v lm_eval >/dev/null 2>&1; then
+        lm_eval --model local-completions \
+            --model_args "model=${alias},base_url=http://127.0.0.1:${port}/v1" \
+            --tasks "${tasks}" --limit "${limit}" --batch_size 8 \
+            > "${qout}" 2>&1
+    else
+        echo "    (lm_eval not installed — skipping quality pass)" > "${qout}"
+    fi
+
+    # Aggregate
+    python3 - "$alias" "$started_at" "$toks_file" "$qout" "${outdir}/${alias}.json" <<'PYEOF' 2>/dev/null
+import json, sys, re, os
+alias, started, toks_file, qout, out_path = sys.argv[1:6]
+result = {"alias": alias, "timestamp": started, "port": 0}
+try:
+    with open(toks_file) as f:
+        result.update(json.load(f))
+except Exception:
+    pass
+# Parse lm-eval output
+try:
+    with open(qout) as f:
+        text = f.read()
+    # lm-eval prints lines like "mmlu|average|0.5234" in its summary
+    for line in text.splitlines():
+        m = re.match(r"\|(\w+)\s*\|.*?\|\s*([\d.]+)\s*\|", line)
+        if m and m.group(1) in ("mmlu", "gsm8k", "humaneval", "arc_challenge", "hellaswag"):
+            key = m.group(1)
+            if key not in result:
+                result[key] = float(m.group(2))
+except Exception:
+    pass
+with open(out_path, "w") as f:
+    json.dump(result, f, indent=2)
+print(f"  ✓ {alias} → {out_path}")
+PYEOF
+}
+
+bench_api_one() {
+    local model_id="$1"  # e.g. deepseek/deepseek-v4-pro
+    local provider_url="${2:-https://inference-api.nousresearch.com/v1}"
+    local token
+    token=$(python3 -c "import json; print(json.load(open('/home/sovthpaw/.hermes/auth.json'))['providers']['nous']['access_token'])" 2>/dev/null)
+    if [ -z "${token}" ]; then
+        echo "  ❌ No Nous API token in ~/.hermes/auth.json"
+        return 1
+    fi
+    local outdir="${TURBOFIT_ROOT}/benchmark-results"
+    mkdir -p "${outdir}"
+    local out_file="${outdir}/$(echo "${model_id}" | tr '/' '_').json"
+    local started_at
+    started_at=$(date -Iseconds)
+
+    python3 - "$model_id" "$provider_url" "$token" "$started_at" "$out_file" <<'PYEOF' 2>/dev/null
+import json, sys, time, urllib.request, urllib.error
+
+model_id, url, token, started, out_path = sys.argv[1:6]
+api_url = f"{url.rstrip('/')}/chat/completions"
+payload = json.dumps({
+    "model": model_id,
+    "messages": [{"role": "user", "content": "Write 200 words about distributed systems."}],
+    "max_tokens": 256,
+    "stream": False,
+}).encode()
+
+result = {"alias": model_id, "timestamp": started, "endpoint": url, "is_api": True}
+try:
+    t0 = time.time()
+    req = urllib.request.Request(api_url, data=payload, headers={
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}",
+    })
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        body = json.loads(resp.read())
+    elapsed = time.time() - t0
+    usage = body.get("usage", {})
+    pt = usage.get("prompt_tokens", 0)
+    ct = usage.get("completion_tokens", 0)
+    result.update({
+        "elapsed_s": round(elapsed, 3),
+        "prompt_tokens": pt,
+        "completion_tokens": ct,
+        "prompt_tok_s": round(pt / max(elapsed, 0.001), 2),
+        "gen_tok_s": round(ct / max(elapsed, 0.001), 2),
+        "model_id": body.get("model", model_id),
+        "provider": body.get("provider", "?"),
+    })
+except urllib.error.HTTPError as e:
+    result["error"] = f"HTTP {e.code}: {e.read().decode()[:200]}"
+except Exception as e:
+    result["error"] = str(e)
+
+with open(out_path, "w") as f:
+    json.dump(result, f, indent=2)
+print(f"  ✓ {model_id} (API) → {out_path}")
+PYEOF
+}
+
+bench_local_all() {
+    echo "═══ Local bench sweep ═══"
+    local count=0 ok=0
+    while IFS=$'\t' read -r alias port; do
+        [ -z "${alias}" ] && continue
+        [ "${port}" = "None" ] && continue
+        count=$((count + 1))
+        if bench_local_one "${alias}"; then
+            ok=$((ok + 1))
+        fi
+    done < <(python3 - "$CATALOG" <<'PYEOF'
+import sys, yaml
+with open(sys.argv[1]) as f:
+    cfg = yaml.safe_load(f) or {}
+for alias, m in sorted(cfg.get("models", {}).items()):
+    role = m.get("role", "either")
+    if role not in ("main", "aux", "either"):
+        continue
+    if not m.get("path"):
+        continue
+    import os
+    if not os.path.exists(m["path"]):
+        continue
+    port = m.get("port", "")
+    if not port:
+        continue
+    print(f"{alias}\t{port}")
+PYEOF
+    )
+    echo "═══ ${ok}/${count} local models benched ═══"
+}
+
+bench_api_all() {
+    echo "═══ API bench sweep ═══"
+    # Curated API list — covers the recommended pairings from the catalog
+    local models=(
+        "deepseek/deepseek-v4-pro"
+        "deepseek/deepseek-v4-flash"
+        "z-ai/glm-5.2"
+        "qwen/qwen3.7-max"
+        "minimaxai/minimax-m3"
+        "qwen/qwen3.7-plus"
+        "xiaomi/mimo-v2.5"
+    )
+    local provider_url="https://inference-api.nousresearch.com/v1"
+    local count=0 ok=0
+    for m in "${models[@]}"; do
+        count=$((count + 1))
+        if bench_api_one "${m}" "${provider_url}"; then
+            ok=$((ok + 1))
+        fi
+    done
+    echo "═══ ${ok}/${count} API models benched ═══"
+}
+
+bench_aggregate() {
+    local outdir="${TURBOFIT_ROOT}/benchmark-results"
+    mkdir -p "${outdir}"
+    python3 - "$outdir" <<'PYEOF'
+import json, os, sys, glob
+outdir = sys.argv[1]
+local_results = []
+api_results = []
+
+# Local: ~/.config/turbofit/benchmarks/<alias>.json
+bench_dir = os.path.join(outdir, "..", "benchmarks")
+for path in sorted(glob.glob(os.path.join(bench_dir, "*.json"))):
+    if ".toks." in path or ".lm_eval." in path:
+        continue
+    try:
+        with open(path) as f:
+            d = json.load(f)
+        if d.get("is_api"):
+            api_results.append(d)
+        else:
+            local_results.append(d)
+    except Exception:
+        continue
+
+# API: ~/.config/turbofit/benchmark-results/<provider>_<model>.json
+for path in sorted(glob.glob(os.path.join(outdir, "*.json"))):
+    if path.endswith("latest.json"):
+        continue
+    try:
+        with open(path) as f:
+            d = json.load(f)
+        if d.get("is_api"):
+            api_results.append(d)
+    except Exception:
+        continue
+
+# Sort local by tier priority: fastest gen_tok_s first
+local_results.sort(key=lambda r: r.get("gen_tok_s", 0), reverse=True)
+api_results.sort(key=lambda r: r.get("gen_tok_s", 0), reverse=True)
+
+out = {
+    "timestamp": __import__("datetime").datetime.now().isoformat(),
+    "local_models": local_results,
+    "api_models": api_results,
+}
+with open(os.path.join(outdir, "latest.json"), "w") as f:
+    json.dump(out, f, indent=2)
+
+print(f"\n╔══ Bench summary ══════════════════════════════════════════════════════╗")
+print(f"║ Local models benched: {len(local_results):<47}║")
+print(f"║ API models benched:   {len(api_results):<47}║")
+if local_results:
+    print(f"║ Fastest local:        {local_results[0].get('alias','?')} @ {local_results[0].get('gen_tok_s', 0)} tok/s{' '*(22-len(local_results[0].get('alias','?')))}║")
+if api_results:
+    print(f"║ Fastest API:          {api_results[0].get('alias','?')} @ {api_results[0].get('gen_tok_s', 0)} tok/s{' '*(22-len(api_results[0].get('alias','?')))}║")
+print(f"╚════════════════════════════════════════════════════════════════════════╝")
+PYEOF
+}
+
+bench_model() {
+    local target="${1:-all}"
+    case "${target}" in
+        all)
+            bench_local_all
+            bench_api_all
+            bench_aggregate
+            ;;
+        --local|local)
+            bench_local_all
+            bench_aggregate
+            ;;
+        --api|api)
+            bench_api_all
+            bench_aggregate
+            ;;
+        --aggregate|aggregate|summary)
+            bench_aggregate
+            ;;
+        --help|-h)
+            cat <<'USAGE'
+serve bench — benchmark local + API models
+
+USAGE:
+  serve bench <alias>          # bench one local model (tok/s + lm-eval)
+  serve bench --local          # bench all role=main|aux local models in catalog
+  serve bench --api            # bench the curated API model set via Nous
+  serve bench all              # bench everything, then aggregate
+  serve bench --aggregate      # just re-aggregate existing results
+
+Results:
+  ~/.config/turbofit/benchmarks/<alias>.json     (local per-model)
+  ~/.config/turbofit/benchmark-results/<model>.json (API per-model)
+  ~/.config/turbofit/benchmark-results/latest.json (aggregated summary)
+USAGE
+            ;;
+        *)
+            bench_local_one "${target}"
+            ;;
+    esac
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# mmproj management: verify, find, download, set correct mmproj per model
+# ─────────────────────────────────────────────────────────────────────────────
+
+# n_embd mapping by model family
+# Qwen3.6-27B dense (Darwin, Prism, Qwopus, Qwable, Carwin): n_embd=5120
+# Qwen3.6-35B-A3B MoE (Carnice, Darwin Apex): n_embd=2048
+# Qwen2.5-Omni-3B: n_embd=2048
+
+manage_mmproj() {
+    local action="${1:-check}"
+    local alias="${2:-}"
+
+    case "${action}" in
+        check)
+            echo "Checking mmproj for all vision models..."
+            python3 - "$CATALOG" <<'PYEOF'
+import sys, os, yaml
+
+catalog_path = sys.argv[1]
+with open(catalog_path) as f:
+    cfg = yaml.safe_load(f) or {}
+
+models = cfg.get("models", {})
+issues = []
+
+for alias, m in sorted(models.items()):
+    vision = m.get("vision", False)
+    mmproj = m.get("mmproj", "")
+    
+    if not vision:
+        continue
+    
+    if not mmproj:
+        issues.append(f"  ❌ {alias}: vision=true but NO mmproj set")
+        continue
+    
+    if not os.path.exists(mmproj):
+        issues.append(f"  ❌ {alias}: mmproj MISSING — {mmproj}")
+        continue
+    
+    # Check if it's a symlink and verify target
+    if os.path.islink(mmproj):
+        target = os.readlink(mmproj)
+        if not os.path.exists(target):
+            issues.append(f"  ❌ {alias}: mmproj BROKEN SYMLINK — {mmproj} → {target}")
+            continue
+    
+    # Determine n_embd from model path
+    path = m.get("path", "")
+    n_embd_model = "?"
+    n_embd_mmproj = "?"
+    
+    # Try to get n_embd from running model
+    port = m.get("port", 0)
+    if port:
+        try:
+            import httpx
+            resp = httpx.get(f"http://127.0.0.1:{port}/v1/models", timeout=2)
+            if resp.status_code == 200:
+                data = resp.json()
+                n_embd_model = data["data"][0]["meta"].get("n_embd", "?")
+        except:
+            pass
+    
+    # Infer n_embd from mmproj filename
+    if "mmproj-BF16" in mmproj or "mmproj-F16" in mmproj:
+        n_embd_mmproj = "2048 (MoE)"
+    elif "mmproj-F32" in mmproj:
+        # Could be 5120 (27B) or 2048 (Omni-3B) — check path
+        if "Omni" in mmproj:
+            n_embd_mmproj = "2048 (Omni-3B)"
+        else:
+            n_embd_mmproj = "5120 (27B dense)"
+    elif "Omni-3B" in mmproj:
+        n_embd_mmproj = "2048 (Omni-3B)"
+    else:
+        n_embd_mmproj = "unknown"
+    
+    # Check for mismatch
+    match = "✅" if (n_embd_model == "?" or n_embd_mmproj == "?" or str(n_embd_model) in n_embd_mmproj) else "⚠️ MISMATCH"
+    
+    if "MISMATCH" in match:
+        issues.append(f"  ⚠️ {alias}: n_embd MISMATCH — model={n_embd_model}, mmproj={n_embd_mmproj}")
+    
+    size = os.path.getsize(mmproj) if os.path.exists(mmproj) else 0
+    size_mb = size // (1024*1024)
+    link = " (symlink)" if os.path.islink(mmproj) else ""
+    print(f"  {match} {alias}: n_embd={n_embd_model} mmproj={n_embd_mmproj} ({size_mb}MB){link}")
+    print(f"       {mmproj}")
+
+if issues:
+    print("\nISSUES FOUND:")
+    for issue in issues:
+        print(issue)
+    print(f"\n{len(issues)} issue(s) found. Run 'serve mmproj fix <alias>' to resolve.")
+else:
+    print("\n✅ All mmproj files verified.")
+PYEOF
+            ;;
+        fix)
+            if [ -z "$alias" ]; then
+                echo "Usage: serve mmproj fix <alias>"
+                echo "  Finds, downloads, and sets the correct mmproj for a model."
+                echo ""
+                echo "  If the model's HF repo has an mmproj, it downloads it."
+                echo "  If not, it finds a compatible mmproj from the same model family."
+                exit 1
+            fi
+            
+            local model_path hf_repo current_mmproj
+            model_path=$(python3 -c "
+import yaml, os
+with open('$CATALOG') as f: cfg = yaml.safe_load(f)
+m = cfg.get('models', {}).get('$alias', {})
+print(m.get('path', ''))
+" 2>/dev/null)
+            hf_repo=$(python3 -c "
+import yaml, os
+with open('$CATALOG') as f: cfg = yaml.safe_load(f)
+m = cfg.get('models', {}).get('$alias', {})
+print(m.get('hf_repo', ''))
+" 2>/dev/null)
+            current_mmproj=$(python3 -c "
+import yaml, os
+with open('$CATALOG') as f: cfg = yaml.safe_load(f)
+m = cfg.get('models', {}).get('$alias', {})
+print(m.get('mmproj', ''))
+" 2>/dev/null)
+            
+            if [ -z "$model_path" ]; then
+                echo "❌ Model '$alias' not found in catalog."
+                exit 1
+            fi
+            
+            local model_dir
+            model_dir=$(dirname "$model_path")
+            
+            echo "Model: $alias"
+            echo "Path:  $model_path"
+            echo "HF:    ${hf_repo:-not set}"
+            echo "Current mmproj: ${current_mmproj:-none}"
+            echo ""
+            
+            # Check if current mmproj exists and is valid
+            if [ -n "$current_mmproj" ] && [ -f "$current_mmproj" ]; then
+                echo "✅ mmproj exists at $current_mmproj"
+                # Verify n_embd match
+                echo "Run 'serve mmproj check' to verify n_embd compatibility."
+                return 0
+            fi
+            
+            # Try to download from HF repo
+            if [ -n "$hf_repo" ]; then
+                echo "Downloading mmproj from HF repo: $hf_repo"
+                # Try common mmproj filenames
+                for mmproj_name in "mmproj-F32.gguf" "mmproj-BF16.gguf" "mmproj-f16.gguf" "mmproj-model-f16.gguf"; do
+                    echo "  Trying: $mmproj_name"
+                    if hf download "$hf_repo" --include="$mmproj_name" --local-dir "$model_dir" 2>/dev/null; then
+                        local new_mmproj="$model_dir/$mmproj_name"
+                        if [ -f "$new_mmproj" ]; then
+                            echo "  ✅ Downloaded: $new_mmproj"
+                            # Update catalog
+                            python3 -c "
+import yaml
+path = '$CATALOG'
+with open(path) as f: cfg = yaml.safe_load(f)
+cfg['models']['$alias']['mmproj'] = '$new_mmproj'
+cfg['models']['$alias']['vision'] = True
+with open(path, 'w') as f: yaml.dump(cfg, f, default_flow_style=False, sort_keys=False)
+print(f'Updated catalog: mmproj set to $new_mmproj')
+" 2>/dev/null
+                            echo "✅ mmproj set permanently in catalog."
+                            return 0
+                        fi
+                    fi
+                done
+                echo "  ⚠️ No mmproj found in HF repo."
+            fi
+            
+            # Fallback: find compatible mmproj from same model family
+            echo ""
+            echo "Searching for compatible mmproj from same model family..."
+            local model_base
+            model_base=$(basename "$model_path")
+            
+            # Determine model family
+            local n_embd_target
+            if echo "$model_base" | grep -qi "35B\|A3B\|MoE\|Apex\|Carnice"; then
+                n_embd_target="2048"
+                echo "  Model family: MoE (n_embd=2048)"
+            elif echo "$model_base" | grep -qi "Omni\|3B"; then
+                n_embd_target="2048"
+                echo "  Model family: Omni-3B (n_embd=2048)"
+            else
+                n_embd_target="5120"
+                echo "  Model family: 27B dense (n_embd=5120)"
+            fi
+            
+            # Search for existing mmproj files with matching n_embd
+            local found_mmproj=""
+            if [ "$n_embd_target" = "2048" ]; then
+                # Look for mmproj-BF16 or mmproj-f16 (MoE)
+                found_mmproj=$(find /home/sovthpaw/Models/ -name "mmproj-BF16.gguf" -o -name "mmproj-f16.gguf" 2>/dev/null | head -1)
+            else
+                # Look for mmproj-F32 (27B dense)
+                found_mmproj=$(find /home/sovthpaw/Models/ -name "mmproj-F32.gguf" -not -path "*Omni*" 2>/dev/null | head -1)
+            fi
+            
+            if [ -n "$found_mmproj" ]; then
+                echo "  Found compatible mmproj: $found_mmproj"
+                # Symlink it into the model dir
+                local new_mmproj="$model_dir/mmproj-F32.gguf"
+                if [ "$n_embd_target" = "2048" ]; then
+                    new_mmproj="$model_dir/mmproj-BF16.gguf"
+                fi
+                ln -sf "$found_mmproj" "$new_mmproj"
+                echo "  Symlinked: $new_mmproj → $found_mmproj"
+                # Update catalog
+                python3 -c "
+import yaml
+path = '$CATALOG'
+with open(path) as f: cfg = yaml.safe_load(f)
+cfg['models']['$alias']['mmproj'] = '$new_mmproj'
+cfg['models']['$alias']['vision'] = True
+with open(path, 'w') as f: yaml.dump(cfg, f, default_flow_style=False, sort_keys=False)
+print(f'Updated catalog: mmproj set to $new_mmproj')
+" 2>/dev/null
+                echo "✅ mmproj set permanently in catalog."
+                return 0
+            else
+                echo "  ❌ No compatible mmproj found on disk."
+                echo ""
+                echo "To fix manually:"
+                echo "  1. Find the correct mmproj from the model's HF repo"
+                echo "  2. Download it: hf download $hf_repo --include='mmproj*' --local-dir $model_dir"
+                echo "  3. Set it: serve register $alias $model_path --mmproj <path>"
+                return 1
+            fi
+            ;;
+        *)
+            echo "Usage: serve mmproj {check|fix <alias>}"
+            echo ""
+            echo "  check          Verify all vision models have correct mmproj"
+            echo "  fix <alias>    Find/download/set correct mmproj for a model"
+            ;;
+    esac
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Recommend: scan catalog, rank by Chris's criteria
+# ─────────────────────────────────────────────────────────────────────────────
+
+recommend_fit() {
+    echo "Scanning catalog + pulling benchmark results from GitHub..."
+    python3.12 - "$CATALOG" <<'PYEOF'
+import sys, yaml, os, json
+from urllib.request import urlopen
+from urllib.error import URLError
+
+cat_path = sys.argv[1]
+with open(cat_path) as f:
+    cfg = yaml.safe_load(f) or {}
+models = cfg.get("models", {})
+
+# Try to pull benchmark results from GitHub
+GITHUB_RAW = "https://raw.githubusercontent.com/SouthpawIN/turbofit/main/skills/turbofit/references/benchmark-results.json"
+bench_data = None
+try:
+    resp = urlopen(GITHUB_RAW, timeout=10)
+    bench_data = json.loads(resp.read())
+    print(f"  (benchmark results from GitHub: {bench_data.get('date', '?')})")
+except Exception:
+    pass
+
+# Build a lookup from benchmark results
+bench_lookup = {}
+if bench_data:
+    for r in bench_data.get("results", []):
+        bench_lookup[r.get("alias", r.get("name", ""))] = r
+
+results = []
+for alias, m in models.items():
+    path = m.get("path", "")
+    if not os.path.exists(path):
+        continue
+    ctx    = m.get("ctx", 0)
+    tok_s  = m.get("tok_s_target", 0)
+    tier   = m.get("tier", "c")
+    vision = m.get("vision", False)
+    size   = m.get("size_gb", 99)
+    role   = m.get("role", "either")
+    if ctx < 65536: continue
+
+    # If we have benchmark data, use it
+    bench = bench_lookup.get(alias, {})
+    if bench:
+        tok_s = bench.get("tok_s", tok_s)
+        tier = bench_data.get("tier_assignments", {}).get(alias, tier)
+        iq = bench.get("intelligence_score", 0)
+        size = bench.get("size_gb", size)
+    else:
+        iq = 0
+
+    if tok_s < 25 and not iq: continue
+
+    tier_score = {"s": 5, "sf": 4, "sd": 3, "f": 2, "c": 1}.get(tier, 1)
+    # Rank by: intelligence first, then tier, then vision, then speed
+    score = iq * 10 + tier_score * 50 + (25 if vision else 0) + (tok_s // 25)
+    results.append((score, alias, tier, tok_s, vision, size, role, iq))
+
+# Sort: score desc
+results.sort(key=lambda x: -x[0])
+
+print(f"\n{'RANK':<5} {'ALIAS':<35} {'TIER':<4} {'IQ':>5} {'tok/s':>6} {'VISION':>6} {'SIZE':>6} {'ROLE':>6} {'SCORE':>5}")
+print("-" * 90)
+for i, (score, alias, tier, tok_s, vision, size, role, iq) in enumerate(results[:20], 1):
+    iq_str = f"{iq:.0f}" if iq else "—"
+    print(f"{i:<5} {alias:<35} {tier:<4} {iq_str:>5} {tok_s:>6} {' 👁' if vision else '':>6} {size:>5.0f}GB {role:>6} {score:>5}")
+
+# Print recommendations
+mains = [r for r in results if r[6] in ("main", "either")]
+auxs = [r for r in results if r[6] in ("aux", "either") and r[4]]  # vision for aux
+
+if mains:
+    best_main = mains[0]
+    print(f"\n  ⭐ MAIN: {best_main[1]} (tier={best_main[2]}, IQ={best_main[7] or '—'}, {best_main[3]} tok/s, {best_main[5]:.0f}GB)")
+if auxs:
+    best_aux = auxs[0]
+    print(f"  ⭐ AUX:  {best_aux[1]} (tier={best_aux[2]}, IQ={best_aux[7] or '—'}, {best_aux[3]} tok/s, {best_aux[5]:.0f}GB, vision=Y)")
+
+print(f"\n{len(results)} models match. Ranked by intelligence → tier → vision → speed.")
+if not bench_data:
+    print("  ⚠ No benchmark results from GitHub. Using catalog tier + tok_s_target only.")
+    print("  Run `python3.12 ~/.hermes/skills/turbofit/scripts/benchmark-pipeline.py --push` to benchmark and publish.")
+PYEOF
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Usage
+# ─────────────────────────────────────────────────────────────────────────────
+
+usage() {
+    cat <<EOF
+turbofit serve v5 — opinionated unified backend (turbofit v5.0.0)
+
+INSTALL / UPDATE
+  serve install                            Install llama.cpp from source
+  serve install <launcher>                 Install one launcher: llama-cpp, ollama, vllm, sglang
+  serve update                             Update llama.cpp
+  serve update <launcher|all>              Update a specific launcher or all
+  serve check                              Show version status for all installed
+
+FIT CHECK
+  serve fit <model> [ctx]                  Run llmfit fit check (default ctx=65536)
+  serve vram                               Probe live GPU VRAM (JSON)
+  serve recommend                          Scan all catalog entries, rank by fit (ctx≥64K, tok/s≥25, Q4, vision)
+
+CATALOG
+  serve register <alias> <path>            Register model (launcher=llama-cpp)
+           [--launcher llama-cpp|ollama|vllm|sglang]
+           [--port N]
+  serve catalog                            Show registered aliases (featured first, tier-ordered)
+
+LAUNCH
+  serve <alias>                            Launch (detached, shows backend/port/logs)
+  serve string <alias>                     Print launch string (no launch)
+  serve stop <alias>                       Stop a running server
+  serve stop-all                           Stop everything
+  serve list                               List running servers + rogue llama-servers on any port
+
+OPINIONATED AUTO (turbofit v5.1 — hardware-aware, API-aware)
+  serve auto main [--vision] [--api] [--free] [--ui ...]   Pick best main (auto-detects GPU, suggests API if needed)
+  serve auto aux [--vision] [--api] [--free] [--ui ...]    Pick best aux
+  serve downscale                          Probe VRAM, shrink ctx / drop aux / swap tier if needed
+  AUTO_CTX=131072 serve auto main          Override ctx target
+
+  Hardware tiers (auto-detected):
+    ≥24GB VRAM: Local main + local aux (full ladder)
+    8-24GB VRAM: API main + local aux OR local main + API aux
+    <8GB / no GPU: API main + API aux (free: DeepSeek V4 Pro + Kimi K2.6)
+
+FETCH / BENCH (from llama-launch)
+  serve fetch <alias>                      Download missing model from HF (uses hf_repo in catalog)
+  serve bench <alias>                      Run lm-eval-harness benchmark (launches model first)
+
+MMPROJ MANAGEMENT
+  serve mmproj check                      Verify all vision models have correct mmproj (n_embd match)
+  serve mmproj fix <alias>                 Find/download/set correct mmproj for a model
+
+HERMES MODEL ROUTING
+  serve main <alias> [--ui tui|dashboard|gateway|desktop|herm]
+                                           Launch + set main + start UI
+  serve aux  <alias> [--ui ...]            Launch + set aux + start UI
+  serve herm <alias>                       Launch + main + herm TUI (herm handles hermes internally)
+  serve herm aux <alias>                   Launch + aux + herm TUI
+
+NVIDIA NIM API (curated, 5 models)
+  serve api list                           Show the curated NVIDIA NIM list
+  serve api use <rank|api_id> [main|aux]   Wire a NIM model into Hermes config
+
+DAEMON (systemd services with wake-on-ping proxy)
+  serve daemon install <alias> [--idle N]  Generate + enable systemd service for catalog model
+  serve daemon remove <alias>             Stop + disable + remove daemon service
+  serve daemon start <alias>              Start daemon (proxy only — backend wakes on ping)
+  serve daemon stop <alias>               Stop daemon (also kills backend, frees VRAM)
+  serve daemon restart <alias>            Stop + start
+  serve daemon status [alias]             Show status of one or all turbofit daemons
+  serve daemon list                       List all turbofit-managed daemon services
+  serve daemon migrate <legacy> [alias]   Migrate a legacy service to turbofit daemon
+
+SHELL ALIASES (installed to ~/.bashrc):
+  name <alias> <path> [--launcher ...]     Register a model alias
+  serve <alias>                            Launch + show backend/port/logs
+  serve auto main                          Pick best main + launch (opinionated)
+  serve downscale                          Adapt running fleet to current VRAM
+
+CATALOG SCHEMA (extended in v5):
+  launcher:    llama-cpp | ollama | vllm | sglang
+  path:        absolute path to GGUF / HF repo
+  port:        integer (auto-assigned if absent)
+  ctx:         context window (64K floor enforced)
+  gpu:         0 | 1 (single-GPU target)
+  mmproj:      path to vision projector (optional)
+  presets:     [nextn, draft-mtp, turbo4-kv, no-mmap, split-none]
+  extra_args:  [list of raw llama-server flags]
+  aliases:     [short, alt, ...]
+  description: one-liner for `serve catalog`
+  tags:        [free-form]
+  tier:        s | sf | sd | f | c  (used by serve auto)
+  featured:    true | false  (Garage top row)
+  tok_s_target: integer  (measured throughput)
+  vision:      true | false
+  size_gb:     float
+  hf_repo:     HF org/repo (for fetch)
+  role:        main | aux | either  (default: aux)
+EOF
+}
+
+# ─── MoA (Mixture of Agents) ─────────────────────────────────────────────────
+# Hermes MoA runs reference models (analysis, no tools) before the aggregator
+# (final response + tools). Turbofit manages which models participate.
+#
+# Presets are stored in Hermes config.yaml under the `moa:` key.
+# Turbofit reads them, recommends based on hardware state, and prints the
+# slash command to activate.
+#
+# See: https://hermes-agent.nousresearch.com/docs/user-guide/features/mixture-of-agents
+
+serve_moa() {
+    local subcmd="${1:-list}"
+    shift || true
+    case "${subcmd}" in
+        list)
+            echo "╔══ MoA Presets ═══════════════════════════════════════════════════════╗"
+            python3 - <<'PYEOF'
+import os, yaml, sys
+cfg_path = os.environ.get("TURBOFIT_HERMES_CONFIG", os.path.expanduser("~/.hermes/config.yaml"))
+try:
+    with open(cfg_path) as f:
+        cfg = yaml.safe_load(f) or {}
+except Exception as e:
+    print(f"  Error reading config: {e}"); sys.exit(1)
+moa = cfg.get("moa", {})
+if not moa:
+    print("  No MoA configuration found."); sys.exit(0)
+default = moa.get("default_preset", "?")
+presets = moa.get("presets", {})
+if not presets:
+    print("  No presets configured."); sys.exit(0)
+for name, p in presets.items():
+    marker = " ← default" if name == default else ""
+    enabled = "✓" if p.get("enabled", False) else "✗"
+    refs = p.get("reference_models", [])
+    agg = p.get("aggregator", {})
+    agg_prov = agg.get("provider", "?")
+    agg_model = agg.get("model", "?")
+    print(f"  {enabled} {name:<12} {len(refs)} ref → {agg_prov}/{agg_model}{marker}")
+PYEOF
+            echo "╚════════════════════════════════════════════════════════════════════════╝"
+            ;;
+        use)
+            local preset="${1:-}"
+            if [ -z "${preset}" ]; then
+                echo "Usage: serve moa use <preset>"
+                echo "Available presets:"
+                serve_moa list
+                exit 1
+            fi
+            echo "To activate MoA preset '${preset}', run this in Hermes:"
+            echo ""
+            echo "  /model ${preset} --provider moa"
+            echo ""
+            echo "This switches your active model to the '${preset}' MoA preset."
+            echo "Reference models will run before the aggregator on each turn."
+            ;;
+        shot)
+            if [ $# -eq 0 ]; then
+                echo "Usage: serve moa shot <prompt>"
+                echo "Runs a one-shot MoA query through the default preset."
+                exit 1
+            fi
+            local prompt="$*"
+            echo "To run a one-shot MoA query, run this in Hermes:"
+            echo ""
+            echo "  /moa ${prompt}"
+            echo ""
+            echo "This runs the prompt through the default MoA preset"
+            echo "(reference models → aggregator) as a single query."
+            ;;
+        status)
+            echo "╔══ MoA Status ════════════════════════════════════════════════════════╗"
+            python3 - <<'PYEOF'
+import os, yaml, sys
+cfg_path = os.environ.get("TURBOFIT_HERMES_CONFIG", os.path.expanduser("~/.hermes/config.yaml"))
+try:
+    with open(cfg_path) as f:
+        cfg = yaml.safe_load(f) or {}
+except Exception as e:
+    print(f"  Error reading config: {e}"); sys.exit(1)
+moa = cfg.get("moa", {})
+if not moa:
+    print("  No MoA configuration found."); sys.exit(0)
+default = moa.get("default_preset", "?")
+presets = moa.get("presets", {})
+p = presets.get(default, {})
+if p:
+    refs = p.get("reference_models", [])
+    agg = p.get("aggregator", {})
+    print(f"  Active preset:  {default}")
+    print(f"  Reference models ({len(refs)}):")
+    for r in refs:
+        print(f"    • {r.get('provider','?')}/{r.get('model','?')}")
+    print(f"  Aggregator:     {agg.get('provider','?')}/{agg.get('model','?')}")
+    print(f"  Ref temp:       {p.get('reference_temperature','?')}")
+    print(f"  Agg temp:       {p.get('aggregator_temperature','?')}")
+    print(f"  Max tokens:     {p.get('max_tokens','?')}")
+    print(f"  Enabled:        {p.get('enabled', False)}")
+else:
+    print(f"  Active preset: {default} (not found in presets)")
+PYEOF
+            echo "╚════════════════════════════════════════════════════════════════════════╝"
+            ;;
+        presets)
+            echo "╔══ MoA Preset Details ═════════════════════════════════════════════════╗"
+            python3 - <<'PYEOF'
+import os, yaml, sys, json
+cfg_path = os.environ.get("TURBOFIT_HERMES_CONFIG", os.path.expanduser("~/.hermes/config.yaml"))
+try:
+    with open(cfg_path) as f:
+        cfg = yaml.safe_load(f) or {}
+except Exception as e:
+    print(f"  Error reading config: {e}"); sys.exit(1)
+moa = cfg.get("moa", {})
+if not moa:
+    print("  No MoA configuration found."); sys.exit(0)
+default = moa.get("default_preset", "?")
+presets = moa.get("presets", {})
+for name, p in presets.items():
+    marker = " (DEFAULT)" if name == default else ""
+    enabled = "enabled" if p.get("enabled", False) else "disabled"
+    refs = p.get("reference_models", [])
+    agg = p.get("aggregator", {})
+    print(f"\n  ── {name}{marker} [{enabled}] ──")
+    print(f"    Reference models ({len(refs)}):")
+    for r in refs:
+        print(f"      provider: {r.get('provider','?')}")
+        print(f"      model:    {r.get('model','?')}")
+    print(f"    Aggregator:")
+    print(f"      provider: {agg.get('provider','?')}")
+    print(f"      model:    {agg.get('model','?')}")
+    print(f"    reference_temperature:   {p.get('reference_temperature','?')}")
+    print(f"    aggregator_temperature:  {p.get('aggregator_temperature','?')}")
+    print(f"    max_tokens:              {p.get('max_tokens','?')}")
+PYEOF
+            echo ""
+            echo "╚════════════════════════════════════════════════════════════════════════╝"
+            ;;
+        recommend)
+            echo "╔══ MoA Recommendation ═════════════════════════════════════════════════╗"
+            echo "  Probing hardware state..."
+            echo ""
+            # 1. Probe VRAM
+            local vram_json free_gb
+            vram_json=$(probe_vram 2>/dev/null || echo '{"free_GB":0}')
+            free_gb=$(echo "${vram_json}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('free_GB',0))" 2>/dev/null || echo "0")
+            # 2. Check which local model ports are alive
+            local darwin_alive="no" carnice_alive="no"
+            if curl -s --max-time 2 http://127.0.0.1:11500/v1/models >/dev/null 2>&1; then
+                darwin_alive="yes"
+            fi
+            if curl -s --max-time 2 http://127.0.0.1:8082/v1/models >/dev/null 2>&1; then
+                carnice_alive="yes"
+            fi
+            echo "  VRAM free:        ${free_gb} GB"
+            echo "  Darwin (11500):   ${darwin_alive}"
+            echo "  Carnice (8082):   ${carnice_alive}"
+            echo ""
+            # 3. Recommend based on state
+            local recommendation reason
+            if [ "${darwin_alive}" = "yes" ] && [ "${carnice_alive}" = "yes" ]; then
+                if python3 -c "exit(0 if float('${free_gb}') >= 8.0 else 1)" 2>/dev/null; then
+                    recommendation="local"
+                    reason="Both local models running and VRAM healthy (≥8GB free). Zero API cost."
+                else
+                    recommendation="fast"
+                    reason="Both local models running but VRAM pressured (<8GB free). Fast preset offloads aggregator to API."
+                fi
+            elif [ "${darwin_alive}" = "yes" ]; then
+                recommendation="default"
+                reason="Only Darwin running. Default preset pairs Darwin (local ref) with DeepSeek V4 Pro (API ref) and GLM 5.2 aggregator."
+            elif [ "${carnice_alive}" = "yes" ]; then
+                recommendation="fast"
+                reason="Only Carnice running. Fast preset uses Carnice as reference with DeepSeek V4 Flash aggregator (speed-optimized)."
+            else
+                recommendation="reasoning"
+                reason="No local models running. Reasoning preset uses all-API models for maximum perspective diversity."
+            fi
+            echo "  ═══════════════════════════════════════════════════"
+            echo "  Recommended preset: ${recommendation}"
+            echo "  Reason: ${reason}"
+            echo ""
+            echo "  To activate, run in Hermes:"
+            echo "    /model ${recommendation} --provider moa"
+            echo "  Or one-shot:"
+            echo "    /moa <your prompt>"
+            echo "╚════════════════════════════════════════════════════════════════════════╝"
+            ;;
+        *)
+            echo "Usage: serve moa {list|use <preset>|shot <prompt>|status|presets|recommend}"
+            echo ""
+            echo "Commands:"
+            echo "  list        List configured MoA presets"
+            echo "  use <p>     Show command to switch to preset <p>"
+            echo "  shot <p>    Show command for one-shot MoA query"
+            echo "  status      Show active preset details"
+            echo "  presets     Show full details of all presets"
+            echo "  recommend   Recommend best preset based on current hardware state"
+            exit 1
+            ;;
+    esac
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Parse top-level flags
+# ─────────────────────────────────────────────────────────────────────────────
+
+UI=""
+AUTO_CTX="${AUTO_CTX:-}"
+gateway_flag=0
+positional=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --ui) UI="$2"; shift 2 ;;
+        --ui=*) UI="${1#--ui=}"; shift ;;
+        --gateway|-gateway) gateway_flag=1; shift ;;
+        --ctx) AUTO_CTX="$2"; shift 2 ;;
+        --ctx=*) AUTO_CTX="${1#--ctx=}"; shift ;;
+        *) positional+=("$1"); shift ;;
+    esac
+done
+if [ "${gateway_flag}" = "1" ] && [ -z "${UI}" ]; then
+    UI="gateway"
+fi
+set -- "${positional[@]+"${positional[@]}"}"
+
+cmd="${1:-help}"
+shift || true
+
+case "${cmd}" in
+    install)        install_launcher "${1:-llama-cpp}" ;;
+    update)         update_all_launchers "${1:-llama-cpp}" ;;
+    check)          check_llama_cpp ;;
+    fit)            check_fit "$@" ;;
+    vram)           probe_vram ;;
+    string)
+        info=$(alias_info "${1:-}" 2>/dev/null) || { echo "Usage: serve string <alias>"; exit 1; }
+        generate_string "${1}"
+        ;;
+    stop)           stop_server "${1:-}" ;;
+    stop-all)       stop_all ;;
+    list|ls|ps)     list_running ;;
+    catalog)        list_catalog ;;
+    register|name)  register_alias "$@" ;;
+    fetch)          fetch_model "${1:-}" ;;
+    bench)
+        case "${1:-run}" in
+            run)      bench_model "${2:-}" ;;
+            pipeline) shift; python3 "${TURBOFIT_SKILL_DIR}/scripts/benchmark-pipeline.py" "$@" ;;
+            pull)
+                echo "Pulling latest benchmark results from GitHub..."
+                curl -sL "https://raw.githubusercontent.com/SouthpawIN/turbofit/main/skills/turbofit/references/benchmark-results.json" \
+                    -o "${TURBOFIT_SKILL_DIR}/references/benchmark-results.json" 2>/dev/null
+                if [ $? -eq 0 ]; then
+                    echo "Done. Results:"
+                    python3 -c "
+import json
+with open('${TURBOFIT_SKILL_DIR}/references/benchmark-results.json') as f:
+    data = json.load(f)
+print(f\"  Date: {data.get('date','?')}\")
+print(f\"  GPU:  {data.get('gpu_name','?')}\")
+print(f\"  CTX:  {data.get('ctx','?')}\")
+print()
+print(f\"{'Model':<30} {'tok/s':>8} {'Size':>8} {'MTP':>5} {'Vis':>5}\")
+print('-'*60)
+for r in sorted(data.get('results',[]), key=lambda x: x.get('tok_s',0), reverse=True):
+    if r.get('status') == 'ok':
+        print(f\"{r['name']:<30} {r['tok_s']:>8.1f} {r.get('size_gb',0):>7.1f}G {'Y' if r.get('has_mtp') else 'N':>5} {'Y' if r.get('has_vision') else 'N':>5}\")
+"
+                else
+                    echo "Failed to download results"
+                fi
+                ;;
+            *)  echo "Usage: serve bench {run <alias>|pipeline [--push]|pull}"; exit 1 ;;
+        esac
+        ;;
+    recommend)      recommend_fit ;;
+    mmproj)         manage_mmproj "$@" ;;
+    auto)
+        # serve auto [main|aux] [--vision] [--free] [--ui ...]
+        # Forward everything to serve_auto which parses its own flags
+        serve_auto "$@"
+        ;;
+    downscale)      serve_downscale ;;
+    main)           serve_main "${1:-}" ;;
+    aux)            serve_aux "${1:-}" ;;
+    herm)           serve_herm "$@" ;;
+    api)
+        # shift — removed: top-level cmd shift already consumed "api"; case below expects "use" or "list" as $1
+        case "${1:-list}" in
+            list) nvidia_nim_list ;;
+            use)  shift; nvidia_nim_use "${1:-}" "${2:-main}" ;;
+            *)    echo "Usage: serve api {list|use <rank|api_id> [main|aux]}"; exit 1 ;;
+        esac
+        ;;
+    daemon)
+        # $1 is the daemon subcommand (install/remove/etc) — already shifted past 'daemon'
+        daemon_cmd="${1:-list}"
+        shift || true
+        case "${daemon_cmd}" in
+            install)  daemon_install "$@" ;;
+            remove)   daemon_remove "$@" ;;
+            start)    daemon_start "$@" ;;
+            stop)     daemon_stop "$@" ;;
+            restart)  daemon_restart "$@" ;;
+            status)   daemon_status "$@" ;;
+            list)     daemon_list ;;
+            migrate)  daemon_migrate "$@" ;;
+            *)        echo "Usage: serve daemon {install|remove|start|stop|restart|status|list|migrate}"; exit 1 ;;
+        esac
+        ;;
+    moa)
+        serve_moa "$@"
+        ;;
+    help|*)
+        if alias_exists "${cmd}" 2>/dev/null; then
+            launch_server "${cmd}"
+        else
+            usage
+        fi
+        ;;
+esac
